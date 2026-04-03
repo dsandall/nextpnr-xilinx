@@ -155,6 +155,7 @@ po::options_description CommandHandler::getGeneralOptions()
     general.add_options()("freq", po::value<double>(), "set target frequency for design in MHz");
     general.add_options()("timing-allow-fail", "allow timing to fail in design");
     general.add_options()("no-tmdriv", "disable timing-driven placement");
+    general.add_options()("no-sa-refine", "skip simulated annealing refinement after HeAP placement");
     general.add_options()("sdf", po::value<std::string>(), "SDF delay back-annotation file to write");
     general.add_options()("sdf-cvc", "enable tweaks for SDF file compatibility with the CVC simulator");
 
@@ -247,6 +248,9 @@ void CommandHandler::setupContext(Context *ctx)
 
     if (vm.count("no-tmdriv"))
         ctx->settings[ctx->id("timing_driven")] = false;
+
+    if (vm.count("no-sa-refine"))
+        ctx->settings[ctx->id("placerHeap/saRefine")] = false;
 
     // Setting default values
     if (ctx->settings.find(ctx->id("target_freq")) == ctx->settings.end())
