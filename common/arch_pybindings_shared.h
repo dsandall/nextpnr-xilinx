@@ -38,8 +38,12 @@ fn_wrapper_2a<Context, decltype(&Context::createCell), &Context::createCell, der
 fn_wrapper_2a_v<Context, decltype(&Context::copyBelPorts), &Context::copyBelPorts, conv_from_str<IdString>,
                 conv_from_str<BelId>>::def_wrap(ctx_cls, "copyBelPorts");
 
+fn_wrapper_1a<Context, decltype(&Context::getBelByName), &Context::getBelByName, conv_to_str<BelId>,
+              conv_from_str<IdString>>::def_wrap(ctx_cls, "getBelByName");
 fn_wrapper_1a<Context, decltype(&Context::getBelType), &Context::getBelType, conv_to_str<IdString>,
               conv_from_str<BelId>>::def_wrap(ctx_cls, "getBelType");
+fn_wrapper_1a<Context, decltype(&Context::getBelLocation), &Context::getBelLocation, pass_through<Loc>,
+              conv_from_str<BelId>>::def_wrap(ctx_cls, "getBelLocation");
 fn_wrapper_1a<Context, decltype(&Context::checkBelAvail), &Context::checkBelAvail, pass_through<bool>,
               conv_from_str<BelId>>::def_wrap(ctx_cls, "checkBelAvail");
 fn_wrapper_1a<Context, decltype(&Context::getBelChecksum), &Context::getBelChecksum, pass_through<uint32_t>,
