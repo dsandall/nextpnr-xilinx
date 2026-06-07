@@ -601,6 +601,12 @@ class HeAPPlacer
     {
         const auto &base = cell_locs[cell->name];
         for (auto child : cell->constr_children) {
+            // Don't fold cells locked to a contract BEL into the chain: they
+            // must keep their fixed placement and must not inherit the chain
+            // root's solve udata (which would enter them into solve_cells and
+            // get them unbound during strict legalisation).
+            if (child->belStrength >= STRENGTH_LOCKED)
+                continue;
             // FIXME: Improve handling of heterogeneous chains
             if (child->type == root->type)
                 chain_size[root->name]++;
@@ -793,6 +799,12 @@ class HeAPPlacer
         // Unbind all cells placed in this solution
         for (auto cell : sorted(ctx->cells)) {
             CellInfo *ci = cell.second;
+            // Never disturb cells locked to a contract BEL (e.g. cross-gen
+            // boundary FFs placed by pre_place). HeAP can otherwise pull a
+            // locked cell into solve_cells via chain_root udata propagation
+            // and unbind it here, breaking the split-flow boundary contract.
+            if (ci->belStrength >= STRENGTH_LOCKED)
+                continue;
             if (ci->bel != BelId() && (ci->udata != dont_solve ||
                                        (chain_root.count(ci->name) && chain_root.at(ci->name)->udata != dont_solve)))
                 ctx->unbindBel(ci->bel);
@@ -922,6 +934,9 @@ class HeAPPlacer
                         if (ctx->checkBelAvail(sz) || (radius > ripup_radius || ctx->rng(20000) < 10)) {
                             CellInfo *bound = ctx->getBoundBelCell(sz);
                             if (bound != nullptr) {
+                                // Never rip up a cell locked to a contract BEL.
+                                if (bound->belStrength >= STRENGTH_LOCKED)
+                                    continue;
                                 if (bound->constr_parent != nullptr || !bound->constr_children.empty() ||
                                     bound->constr_abs_z)
                                     continue;
@@ -994,6 +1009,11 @@ class HeAPPlacer
                                     goto fail;
                             targets.emplace_back(vc, target);
                             for (auto child : vc->constr_children) {
+                                // A contract-locked child stays where pre_place
+                                // put it; don't try to relocate it as part of a
+                                // constrained-chain move.
+                                if (child->belStrength >= STRENGTH_LOCKED)
+                                    continue;
                                 Loc cloc = ploc;
                                 if (child->constr_x != child->UNCONSTR)
                                     cloc.x += child->constr_x;
