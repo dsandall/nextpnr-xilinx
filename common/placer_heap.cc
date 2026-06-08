@@ -833,6 +833,14 @@ class HeAPPlacer
             int radius = 0;
             int iter = 0;
             int iter_at_radius = 0;
+            // Non-resetting watchdog. The `iter` guard below is defeated when the
+            // search radius saturates (iter is reset to 0 every time radius
+            // advances, see further down), so an unplaceable region-constrained
+            // cell would otherwise spin forever instead of erroring. This counter
+            // is never reset, giving a hard bound that turns that infinite loop
+            // into a clear diagnostic. (split-flow KI-2: over-utilised gen region
+            // with locked boundary anchors made this hang silently.)
+            int placed_iter = 0;
             bool placed = false;
             BelId bestBel;
             int best_inp_len = std::numeric_limits<int>::max();
@@ -856,6 +864,30 @@ class HeAPPlacer
                 if (iter > std::max(10000, 3 * int(ctx->cells.size())))
                     log_error("Unable to find legal placement for cell '%s', check constraints and utilisation.\n",
                               ctx->nameOf(ci));
+
+                // Hard watchdog that the radius-reset cannot defeat: if we have
+                // tried this many times for a single cell, the placement is not
+                // going to converge. Fail loudly with actionable context instead
+                // of looping forever (split-flow KI-2).
+                if (++placed_iter > std::max(200000, 50 * int(ctx->cells.size()))) {
+                    if (ci->region != nullptr) {
+                        auto &rb = constraint_region_bounds[ci->region->name];
+                        log_error(
+                                "HeAP legalise: no legal placement for cell '%s' (type '%s', chain_size %d) within "
+                                "constraint region '%s' (bels x[%d..%d] y[%d..%d]) after %d attempts, search radius "
+                                "saturated at %d. The region is over-utilised or cannot host this cell (e.g. a carry "
+                                "chain that does not fit alongside the locked boundary anchors). Widen the floorplan "
+                                "region or spread/reduce the locked anchors. [split-flow KI-2]\n",
+                                ctx->nameOf(ci), ci->type.c_str(ctx), int(chain_size[ci->name]),
+                                ci->region->name.c_str(ctx), rb.x0, rb.x1, rb.y0, rb.y1, placed_iter, radius);
+                    } else {
+                        log_error(
+                                "HeAP legalise: no legal placement for unconstrained cell '%s' (type '%s', chain_size "
+                                "%d) after %d attempts, search radius saturated at %d; design is likely at the "
+                                "utilisation limit. [split-flow KI-2]\n",
+                                ctx->nameOf(ci), ci->type.c_str(ctx), int(chain_size[ci->name]), placed_iter, radius);
+                    }
+                }
 
                 int rx = radius, ry = radius;
 
