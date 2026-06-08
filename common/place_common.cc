@@ -502,26 +502,36 @@ int get_constraints_distance(const Context *ctx, const CellInfo *cell)
     if (cell->bel == BelId())
         return 100000;
     Loc loc = ctx->getBelLocation(cell->bel);
-    if (cell->constr_parent == nullptr) {
-        if (cell->constr_x != cell->UNCONSTR)
-            dist += std::abs(cell->constr_x - loc.x);
-        if (cell->constr_y != cell->UNCONSTR)
-            dist += std::abs(cell->constr_y - loc.y);
-        if (cell->constr_z != cell->UNCONSTR)
-            dist += std::abs(cell->constr_z - loc.z);
-    } else {
-        if (cell->constr_parent->bel == BelId())
-            return 100000;
-        Loc parent_loc = ctx->getBelLocation(cell->constr_parent->bel);
-        if (cell->constr_x != cell->UNCONSTR)
-            dist += std::abs(cell->constr_x - (loc.x - parent_loc.x));
-        if (cell->constr_y != cell->UNCONSTR)
-            dist += std::abs(cell->constr_y - (loc.y - parent_loc.y));
-        if (cell->constr_z != cell->UNCONSTR) {
-            if (cell->constr_abs_z)
+    // A cell locked to a contract BEL (e.g. a split-flow boundary anchor placed
+    // by pre_place) is at its required position by definition: the lock is
+    // authoritative over its relative (chain-packing) constraints. Counting
+    // those as unsatisfied makes the legaliser's constraint-satisfaction check
+    // fail for the whole chain — even though the lock, not the packing, is what
+    // we want honoured. So skip the locked cell's own relative distance while
+    // still recursing into its (non-locked) children, which remain placed
+    // relative to the locked parent.
+    if (cell->belStrength < STRENGTH_LOCKED) {
+        if (cell->constr_parent == nullptr) {
+            if (cell->constr_x != cell->UNCONSTR)
+                dist += std::abs(cell->constr_x - loc.x);
+            if (cell->constr_y != cell->UNCONSTR)
+                dist += std::abs(cell->constr_y - loc.y);
+            if (cell->constr_z != cell->UNCONSTR)
                 dist += std::abs(cell->constr_z - loc.z);
-            else
-                dist += std::abs(cell->constr_z - (loc.z - parent_loc.z));
+        } else {
+            if (cell->constr_parent->bel == BelId())
+                return 100000;
+            Loc parent_loc = ctx->getBelLocation(cell->constr_parent->bel);
+            if (cell->constr_x != cell->UNCONSTR)
+                dist += std::abs(cell->constr_x - (loc.x - parent_loc.x));
+            if (cell->constr_y != cell->UNCONSTR)
+                dist += std::abs(cell->constr_y - (loc.y - parent_loc.y));
+            if (cell->constr_z != cell->UNCONSTR) {
+                if (cell->constr_abs_z)
+                    dist += std::abs(cell->constr_z - loc.z);
+                else
+                    dist += std::abs(cell->constr_z - (loc.z - parent_loc.z));
+            }
         }
     }
     for (auto child : cell->constr_children)
