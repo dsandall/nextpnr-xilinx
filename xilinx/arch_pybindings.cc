@@ -32,9 +32,11 @@ void arch_wrap_python()
 
     class_<BelId>("BelId").def_readwrite("index", &BelId::index);
 
-    class_<WireId>("WireId").def_readwrite("index", &WireId::index);
+    // tile exposed (alongside index) so routing can be serialised by the globally
+    // stable {tile,index} and re-bound via bindPipByLoc/bindWireByLoc (docs/44).
+    class_<WireId>("WireId").def_readwrite("index", &WireId::index).def_readwrite("tile", &WireId::tile);
 
-    class_<PipId>("PipId").def_readwrite("index", &PipId::index);
+    class_<PipId>("PipId").def_readwrite("index", &PipId::index).def_readwrite("tile", &PipId::tile);
 
     class_<BelPin>("BelPin").def_readwrite("bel", &BelPin::bel).def_readwrite("pin", &BelPin::pin);
 
@@ -60,6 +62,21 @@ void arch_wrap_python()
     typedef UphillPipRange AliasPipRange;
 
 #include "arch_pybindings_shared.h"
+
+    // Split-flow option (c): bind routing by globally-stable {tile,index} (docs/44).
+    fn_wrapper_4a_v<Context, decltype(&Context::bindPipByLoc), &Context::bindPipByLoc, pass_through<int>,
+                    pass_through<int>, addr_and_unwrap<NetInfo>, pass_through<PlaceStrength>>::def_wrap(ctx_cls,
+                                                                                                       "bindPipByLoc");
+    fn_wrapper_4a_v<Context, decltype(&Context::bindWireByLoc), &Context::bindWireByLoc, pass_through<int>,
+                    pass_through<int>, addr_and_unwrap<NetInfo>, pass_through<PlaceStrength>>::def_wrap(ctx_cls,
+                                                                                                       "bindWireByLoc");
+    fn_wrapper_1a<Context, decltype(&Context::getNetinfoSourceWire), &Context::getNetinfoSourceWire,
+                  pass_through<WireId>, addr_and_unwrap<NetInfo>>::def_wrap(ctx_cls, "getNetinfoSourceWire");
+    fn_wrapper_1a<Context, decltype(&Context::getNetRoutingLocs), &Context::getNetRoutingLocs,
+                  pass_through<std::string>, addr_and_unwrap<NetInfo>>::def_wrap(ctx_cls, "getNetRoutingLocs");
+    fn_wrapper_3a_v<Context, decltype(&Context::bindNetRoutingLocs), &Context::bindNetRoutingLocs,
+                    addr_and_unwrap<NetInfo>, pass_through<std::string>, pass_through<PlaceStrength>>::def_wrap(
+            ctx_cls, "bindNetRoutingLocs");
 
     WRAP_RANGE(Bel, conv_to_str<BelId>);
     WRAP_RANGE(Wire, conv_to_str<WireId>);

@@ -219,6 +219,9 @@ BOOST_PYTHON_MODULE(MODULE_NAME)
     auto pm_cls = class_<ContextualWrapper<PipMap &>>("PipMap", no_init);
     readwrite_wrapper<PipMap &, decltype(&PipMap::pip), &PipMap::pip, conv_to_str<PipId>,
                       conv_from_str<PipId>>::def_wrap(pm_cls, "pip");
+    // Raw PipId object (read .tile/.index) -- the string form does not round-trip
+    // through getPipByName (docs/38), so dump routing by {tile,index} (docs/44).
+    readonly_wrapper<PipMap &, decltype(&PipMap::pip), &PipMap::pip, pass_through<PipId>>::def_wrap(pm_cls, "pip_obj");
     readwrite_wrapper<PipMap &, decltype(&PipMap::strength), &PipMap::strength, pass_through<PlaceStrength>,
                       pass_through<PlaceStrength>>::def_wrap(pm_cls, "strength");
 

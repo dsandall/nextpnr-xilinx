@@ -1001,6 +1001,16 @@ struct Arch : BaseCtx
         refreshUiWire(wire);
     }
 
+    // Split-flow bind (docs/44, option c): bind a wire by WireId {tile,index}
+    // (the net's source/root wire, which carries no driving pip). See bindPipByLoc.
+    void bindWireByLoc(int tile, int index, NetInfo *net, PlaceStrength strength)
+    {
+        WireId wire;
+        wire.tile = tile;
+        wire.index = index;
+        bindWire(wire, net, strength);
+    }
+
     void unbindWire(WireId wire)
     {
         NPNR_ASSERT(wire != WireId());
@@ -1125,6 +1135,55 @@ struct Arch : BaseCtx
         net->wires[dst].strength = strength;
         refreshUiPip(pip);
         refreshUiWire(dst);
+    }
+
+    // Split-flow bind (docs/44, option c): bind routing by PipId {tile,index}
+    // instead of by name. getPipName/getPipByName are not inverse in this fork
+    // (docs/38), so a dumped pip string cannot be re-bound; the raw {tile,index}
+    // is globally stable for a fixed part and reconstructs the PipId directly.
+    void bindPipByLoc(int tile, int index, NetInfo *net, PlaceStrength strength)
+    {
+        PipId pip;
+        pip.tile = tile;
+        pip.index = index;
+        bindPip(pip, net, strength);
+    }
+
+    // Serialise a net's COMPLETE routing tree (every net->wires entry: the wire and
+    // its driving pip, by globally-stable {tile,index}) as "wt,wi,pt,pi;..." with
+    // pt<0 marking a root/site wire (no driving pip). Re-applied with
+    // bindNetRoutingLocs so the GEN signal routing crosses the bind process boundary
+    // EXACTLY (docs/44 option c) -- pip/wire *names* don't round-trip (docs/38), and
+    // router1's legality check requires every routed wire (incl. site wires) present.
+    std::string getNetRoutingLocs(NetInfo *net) const
+    {
+        std::string s;
+        char buf[80];
+        for (auto &it : net->wires) {
+            WireId w = it.first;
+            PipId p = it.second.pip;
+            snprintf(buf, sizeof(buf), "%d,%d,%d,%d;", w.tile, w.index, p.tile, p.index);
+            s += buf;
+        }
+        return s;
+    }
+
+    void bindNetRoutingLocs(NetInfo *net, std::string s, PlaceStrength strength)
+    {
+        size_t pos = 0;
+        while (pos < s.size()) {
+            int wt = 0, wi = 0, pt = 0, pi = 0;
+            if (std::sscanf(s.c_str() + pos, "%d,%d,%d,%d", &wt, &wi, &pt, &pi) != 4)
+                break;
+            if (pt < 0)
+                bindWireByLoc(wt, wi, net, strength); // root / site source wire
+            else
+                bindPipByLoc(pt, pi, net, strength);  // binds the pip's dst wire too
+            size_t semi = s.find(';', pos);
+            if (semi == std::string::npos)
+                break;
+            pos = semi + 1;
+        }
     }
 
     void unbindPip(PipId pip)
