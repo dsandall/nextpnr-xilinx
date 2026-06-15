@@ -66,6 +66,7 @@ struct Router2
         int total_route_us = 0;
         float max_crit = 0;
         int fail_count = 0;
+        bool is_reuse = false;   // split-flow option (c): yields to fresh nets (docs/47)
     };
 
     struct WireScore
@@ -137,6 +138,7 @@ struct Router2
             ni->udata = i;
             nets_by_udata.at(i) = ni;
             nets.at(i).arcs.resize(ni->users.size());
+            nets.at(i).is_reuse = ni->attrs.count(ctx->id("REUSE_NET")) != 0;
 
             // Start net bounding box at overall min/max
             nets.at(i).bb.x0 = std::numeric_limits<int>::max();
@@ -351,6 +353,16 @@ struct Router2
                                           ctx->getDelayEpsilon());
         float present_cost = present_wire_cost(wd, net->udata);
         float hist_cost = wd.hist_cong_cost;
+        // Split-flow option (c) (docs/47): a REUSED net YIELDS to fresh nets. It pays a
+        // stiff penalty to route onto a wire some OTHER net is already using, so when a
+        // reused arc is ripped under contention it reroutes AROUND the contested wire
+        // rather than ping-ponging back onto it (which left offchip_aes stuck at
+        // overuse=2 for 40k+ iters). The fresh net pays normal cost and wins the wire.
+        if (nd.is_reuse) {
+            size_t others = wd.bound_nets.size() - (wd.bound_nets.count(net->udata) ? 1 : 0);
+            if (others > 0)
+                present_cost *= 8.0f;
+        }
         float bias_cost = 0;
         int source_uses = 0;
         if (wd.bound_nets.count(net->udata))

@@ -1170,6 +1170,11 @@ struct Arch : BaseCtx
 
     void bindNetRoutingLocs(NetInfo *net, std::string s, PlaceStrength strength)
     {
+        // Mark this as a REUSED net so router2 makes it YIELD to fresh nets under
+        // contention (docs/47): a reused net pays a penalty to stay on a wire another
+        // net wants, so a ripped reused arc reroutes AROUND the contested wire instead
+        // of ping-ponging back onto it.
+        net->attrs[id("REUSE_NET")] = Property(1);
         size_t pos = 0;
         while (pos < s.size()) {
             int wt = 0, wi = 0, pt = 0, pi = 0;
