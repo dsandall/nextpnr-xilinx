@@ -1157,11 +1157,23 @@ struct Arch : BaseCtx
     // router1's legality check requires every routed wire (incl. site wires) present.
     std::string getNetRoutingLocs(NetInfo *net) const
     {
+        // Reuse only the general INTER-TILE routing; drop DRIVEN site-internal wires
+        // (docs/47). LUT inputs are route-time PERMUTABLE (the router picks which
+        // physical A1..D6 pin a signal uses), so the standalone's pin choice differs
+        // from the bind's -- reusing those site hops made two reused nets collide on
+        // one LUT-input site wire. A site wire with a driving pip is an intermediate /
+        // sink site hop (e.g. a LUT input); drop it and let the bind re-route the short
+        // hop into the correctly-assigned pin. A site wire with NO driving pip is the
+        // net's root (the driver's own output) -- keep it. INT routing is all kept, so
+        // the expensive bulk is still reused. (Context is incomplete here, so the root
+        // is found by null pip, not getNetinfoSourceWire.)
         std::string s;
         char buf[80];
         for (auto &it : net->wires) {
             WireId w = it.first;
             PipId p = it.second.pip;
+            if (p != PipId() && getWireName(w).str(this).compare(0, 9, "SITEWIRE/") == 0)
+                continue;
             snprintf(buf, sizeof(buf), "%d,%d,%d,%d;", w.tile, w.index, p.tile, p.index);
             s += buf;
         }
