@@ -573,6 +573,28 @@ class HeAPPlacer
                 }
             }
         }
+        // Guarantee every cell has a cell_locs entry. An unbound constr-child whose
+        // chain root is a *bound/locked* cell is never seeded above (the
+        // constr_parent!=nullptr case has no else) and update_all_chains only walks
+        // unlocked place_cells -- so total_hpwl's cell_locs.at() throws. This arises
+        // in the bind pass (docs/42): packer-inserted const / FFMUX cells cluster
+        // onto a locked GEN cell. Seed them at their (locked) root's location; the
+        // legaliser then binds them into the root's slice (see place_locked_children).
+        // No-op for designs whose cells are all already seeded.
+        for (auto cell : sorted(ctx->cells)) {
+            CellInfo *ci = cell.second;
+            if (cell_locs.count(ci->name))
+                continue;
+            CellInfo *root = ci;
+            while (root->constr_parent != nullptr)
+                root = root->constr_parent;
+            if (!cell_locs.count(root->name))
+                continue;
+            cell_locs[ci->name].x = cell_locs[root->name].x;
+            cell_locs[ci->name].y = cell_locs[root->name].y;
+            cell_locs[ci->name].locked = cell_locs[root->name].locked;
+            cell_locs[ci->name].global = false;
+        }
     }
 
     // Setup the cells to be solved, returns the number of rows
@@ -808,6 +830,47 @@ class HeAPPlacer
             if (ci->bel != BelId() && (ci->udata != dont_solve ||
                                        (chain_root.count(ci->name) && chain_root.at(ci->name)->udata != dont_solve)))
                 ctx->unbindBel(ci->bel);
+        }
+
+        // Place unbound children of already-bound (typically LOCKED) chain roots.
+        // The bind pass (docs/42) locks GEN cells to fixed BELs; such a locked root
+        // never enters solve_cells, so the greedy loop below never visits it -- and
+        // its packer-inserted children (const tie LUTs, FFMUX/dffopt cells) would
+        // stay unplaced and later assert (bindBel on a null bel). Bind each unbound
+        // child into its constrained slot relative to the bound ancestor.
+        for (auto cell : sorted(ctx->cells)) {
+            CellInfo *root = cell.second;
+            if (root->bel == BelId() || root->constr_children.empty())
+                continue;
+            std::queue<CellInfo *> q;
+            q.push(root);
+            while (!q.empty()) {
+                CellInfo *par = q.front();
+                q.pop();
+                if (par->bel == BelId())
+                    continue;
+                Loc ploc = ctx->getBelLocation(par->bel);
+                for (auto child : par->constr_children) {
+                    if (child->bel == BelId()) {
+                        Loc cloc = ploc;
+                        if (child->constr_x != child->UNCONSTR)
+                            cloc.x += child->constr_x;
+                        if (child->constr_y != child->UNCONSTR)
+                            cloc.y += child->constr_y;
+                        if (child->constr_z != child->UNCONSTR)
+                            cloc.z = child->constr_abs_z ? child->constr_z : (ploc.z + child->constr_z);
+                        BelId target = ctx->getBelByLocation(cloc);
+                        if (target != BelId() && ctx->checkBelAvail(target) &&
+                            ctx->getBelType(target) == child->type) {
+                            ctx->bindBel(target, child, STRENGTH_STRONG);
+                            cell_locs[child->name].x = cloc.x;
+                            cell_locs[child->name].y = cloc.y;
+                            cell_locs[child->name].locked = true;
+                        }
+                    }
+                    q.push(child);
+                }
+            }
         }
 
         // At the moment we don't follow the full HeAP algorithm using cuts for legalisation, instead using
@@ -1299,11 +1362,18 @@ class HeAPPlacer
             for (auto &cell : p->cell_locs) {
                 if (!beltype.count(ctx->cells.at(cell.first)->type))
                     continue;
-                // Transfer chain extents to the actual chaines structure
+                // Transfer chain extents to the actual chaines structure.
+                // The extent-building loop above skips locked cells (belStrength >
+                // STRENGTH_STRONG), so a locked chain root has no cell_extents entry;
+                // guard the lookup (locked chains are fixed and need no spread extent)
+                // instead of throwing -- needed for the bind pass's locked GEN
+                // clusters (docs/42).
                 ChainExtent *ce = nullptr;
-                if (p->chain_root.count(cell.first))
+                if (p->chain_root.count(cell.first) &&
+                    cell_extents.count(p->chain_root.at(cell.first)->name))
                     ce = &(cell_extents.at(p->chain_root.at(cell.first)->name));
-                else if (!ctx->cells.at(cell.first)->constr_children.empty())
+                else if (!ctx->cells.at(cell.first)->constr_children.empty() &&
+                         cell_extents.count(cell.first))
                     ce = &(cell_extents.at(cell.first));
                 if (ce) {
                     auto &lce = chaines.at(cell.second.x).at(cell.second.y);
