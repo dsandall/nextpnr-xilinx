@@ -114,7 +114,8 @@ void pyinterpreter_preinit()
 
 void pyinterpreter_initialize()
 {
-    PyEval_InitThreads();
+    // PyEval_InitThreads() was a no-op since Python 3.7 and removed in 3.13;
+    // the GIL is always initialised, so just save the main thread state.
     MainThreadState = PyEval_SaveThread();
     PyEval_AcquireThread(MainThreadState);
     m_threadState = Py_NewInterpreter();
@@ -139,9 +140,11 @@ void pyinterpreter_finalize()
 
     PyEval_AcquireThread(m_threadState);
     Py_EndInterpreter(m_threadState);
-    PyEval_ReleaseLock();
-
-    PyEval_RestoreThread(MainThreadState);
+    // Py_EndInterpreter leaves the GIL held with no current thread state.
+    // PyEval_ReleaseLock() (removed in 3.13) used to drop that orphaned lock
+    // before re-acquiring with the main state; PyThreadState_Swap keeps the GIL
+    // held and makes MainThreadState current in one step.
+    PyThreadState_Swap(MainThreadState);
 }
 
 void pyinterpreter_aquire()
