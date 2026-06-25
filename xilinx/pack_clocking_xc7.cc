@@ -114,8 +114,16 @@ void XC7Packer::pack_plls()
 
             // Fixup routing
             if (str_or_default(ci->params, ctx->id("COMPENSATION"), "INTERNAL") == "INTERNAL") {
-                disconnect_port(ctx, ci, ctx->id("CLKFBIN"));
-                connect_port(ctx, ctx->nets[ctx->id("$PACKER_VCC_NET")].get(), ci, ctx->id("CLKFBIN"));
+                // Vivado's INTERNAL-compensation MMCM wires CLKFBIN <- CLKFBOUT
+                // directly (golden top_bit.golden.v: `assign CLKFBIN = CLKFBOUT`).
+                // The original code unconditionally tied CLKFBIN to VCC, which
+                // leaves the PLL feedback loop OPEN -> the MMCM never locks on
+                // silicon (skew-db, docs). Only tie off when the user left CLKFBIN
+                // unconnected; preserve an explicit feedback so the loop can close.
+                if (get_net_or_empty(ci, ctx->id("CLKFBIN")) == nullptr) {
+                    disconnect_port(ctx, ci, ctx->id("CLKFBIN"));
+                    connect_port(ctx, ctx->nets[ctx->id("$PACKER_VCC_NET")].get(), ci, ctx->id("CLKFBIN"));
+                }
             }
         }
     }
