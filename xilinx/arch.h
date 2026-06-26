@@ -673,6 +673,34 @@ struct ArchArgs
     std::string chipdb;
 };
 
+// --- Split-flow routing-locs serialisation contract (docs/44 option c; F3) ---
+// getNetRoutingLocs / bindNetRoutingLocs move a GEN's signal routing across the
+// bind process boundary as a string of "wt,wi,pt,pi;" records: a wire {tile,index}
+// and the {tile,index} of its DRIVING pip. A net-root / site-source wire has NO
+// driving pip; it is marked with this EXPLICIT sentinel for (pt,pi) rather than
+// leaning on PipId()'s default field values happening to be negative. The chosen
+// value is still -1 so the on-wire bytes are identical to the old (implicit) form
+// -- a known-good reuse dump round-trips bit-for-bit -- but the contract is now
+// named on both the encode and decode side and is unit-tested for round-trip
+// stability (tests/xilinx/routing_locs_roundtrip.cc).
+static constexpr int ROUTING_LOC_ROOT_SENTINEL = -1;
+
+// Decode predicate: is this serialised record a root/site-source wire (no pip)?
+// Accepts any negative pt so a legacy dump (implicit PipId() = {-1,-1}) still
+// parses identically; the encoder always emits ROUTING_LOC_ROOT_SENTINEL.
+static inline bool routingLocIsRoot(int pt) { return pt < 0; }
+
+// Encode one wire record. p == PipId() (a root / site-source wire) emits the
+// explicit sentinel pair; any real pip emits its own {tile,index}.
+static inline void appendRoutingLoc(std::string &s, int32_t wt, int32_t wi, PipId p)
+{
+    char buf[80];
+    int pt = (p == PipId()) ? ROUTING_LOC_ROOT_SENTINEL : p.tile;
+    int pi = (p == PipId()) ? ROUTING_LOC_ROOT_SENTINEL : p.index;
+    snprintf(buf, sizeof(buf), "%d,%d,%d,%d;", wt, wi, pt, pi);
+    s += buf;
+}
+
 struct Arch : BaseCtx
 {
     boost::iostreams::mapped_file_source blob_file;
@@ -1151,7 +1179,8 @@ struct Arch : BaseCtx
 
     // Serialise a net's COMPLETE routing tree (every net->wires entry: the wire and
     // its driving pip, by globally-stable {tile,index}) as "wt,wi,pt,pi;..." with
-    // pt<0 marking a root/site wire (no driving pip). Re-applied with
+    // (pt,pi) == ROUTING_LOC_ROOT_SENTINEL marking a root/site wire (no driving
+    // pip). Re-applied with
     // bindNetRoutingLocs so the GEN signal routing crosses the bind process boundary
     // EXACTLY (docs/44 option c) -- pip/wire *names* don't round-trip (docs/38), and
     // router1's legality check requires every routed wire (incl. site wires) present.
@@ -1168,14 +1197,15 @@ struct Arch : BaseCtx
         // the expensive bulk is still reused. (Context is incomplete here, so the root
         // is found by null pip, not getNetinfoSourceWire.)
         std::string s;
-        char buf[80];
         for (auto &it : net->wires) {
             WireId w = it.first;
             PipId p = it.second.pip;
             if (p != PipId() && getWireName(w).str(this).compare(0, 9, "SITEWIRE/") == 0)
                 continue;
-            snprintf(buf, sizeof(buf), "%d,%d,%d,%d;", w.tile, w.index, p.tile, p.index);
-            s += buf;
+            // Root/site-source wire (p == PipId()) emits the explicit
+            // ROUTING_LOC_ROOT_SENTINEL for (pt,pi); a real pip emits its own
+            // {tile,index}. Bytes are identical to the old implicit form (-1,-1).
+            appendRoutingLoc(s, w.tile, w.index, p);
         }
         return s;
     }
@@ -1192,8 +1222,8 @@ struct Arch : BaseCtx
             int wt = 0, wi = 0, pt = 0, pi = 0;
             if (std::sscanf(s.c_str() + pos, "%d,%d,%d,%d", &wt, &wi, &pt, &pi) != 4)
                 break;
-            if (pt < 0)
-                bindWireByLoc(wt, wi, net, strength); // root / site source wire
+            if (routingLocIsRoot(pt))
+                bindWireByLoc(wt, wi, net, strength); // root / site source wire (sentinel pt)
             else
                 bindPipByLoc(pt, pi, net, strength);  // binds the pip's dst wire too
             size_t semi = s.find(';', pos);
