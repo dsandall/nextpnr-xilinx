@@ -595,6 +595,31 @@ void BaseCtx::archInfoToAttributes()
             first = false;
         }
         ni->attrs[id("ROUTING")] = routing;
+#ifdef ARCH_XILINX
+        // ROUTING (above) serialises the tree by wire/pip *name* for human + renderer
+        // consumption (tools/render_bind.py), but getPipName/getPipByName are NOT
+        // inverse in this fork (docs/38) -- reloading a name-based tree aborts in
+        // getPipByName (std::out_of_range on the "SITEWIRE" pseudo-tile). So ALSO emit
+        // a faithful loc form keyed by globally-stable {tile,index} (the same encoding
+        // getNetRoutingLocs/bindNetRoutingLocs use for reuse, docs/82) PLUS the per-wire
+        // strength, so a written design round-trips through attributesToArchInfo. Unlike
+        // getNetRoutingLocs this keeps EVERY wire (incl. site hops): this is a faithful
+        // reload of a frozen design, not the INT-only/yielding reuse policy. Format:
+        // "wt,wi,pt,pi,strength;"  with (pt,pi) == -1 for a root/site-source wire.
+        {
+            std::string locs;
+            char buf[96];
+            for (auto &item : ni->wires) {
+                PipId p = item.second.pip;
+                int pt = (p == PipId()) ? -1 : p.tile;
+                int pi = (p == PipId()) ? -1 : p.index;
+                snprintf(buf, sizeof(buf), "%d,%d,%d,%d,%d;", item.first.tile, item.first.index,
+                         pt, pi, (int)item.second.strength);
+                locs += buf;
+            }
+            ni->attrs[id("ROUTING_LOCS")] = locs;
+        }
+#endif
     }
 }
 
@@ -657,6 +682,32 @@ void BaseCtx::attributesToArchInfo()
     }
     for (auto &net : getCtx()->nets) {
         auto ni = net.second.get();
+#ifdef ARCH_XILINX
+        // Prefer the faithful loc form (ROUTING_LOCS, see archInfoToAttributes): bind by
+        // globally-stable {tile,index} so a written design reloads EXACTLY -- the
+        // name-based ROUTING path below aborts on this fork (getPipByName, docs/38). Each
+        // record is "wt,wi,pt,pi,strength;"; (pt,pi) < 0 marks a root/site-source wire.
+        auto vloc = ni->attrs.find(id("ROUTING_LOCS"));
+        if (vloc != ni->attrs.end()) {
+            const std::string s = vloc->second.as_string();
+            size_t pos = 0;
+            while (pos < s.size()) {
+                int wt = 0, wi = 0, pt = 0, pi = 0, st = 0;
+                if (std::sscanf(s.c_str() + pos, "%d,%d,%d,%d,%d", &wt, &wi, &pt, &pi, &st) != 5)
+                    break;
+                PlaceStrength strength = (PlaceStrength)st;
+                if (pt < 0)
+                    getCtx()->bindWireByLoc(wt, wi, ni, strength); // root / site-source wire
+                else
+                    getCtx()->bindPipByLoc(pt, pi, ni, strength);  // binds the pip's dst wire too
+                size_t semi = s.find(';', pos);
+                if (semi == std::string::npos)
+                    break;
+                pos = semi + 1;
+            }
+            continue; // bound from locs; skip the (broken-on-xilinx) name path below
+        }
+#endif
         auto val = ni->attrs.find(id("ROUTING"));
         if (val != ni->attrs.end()) {
             std::vector<std::string> strs;
