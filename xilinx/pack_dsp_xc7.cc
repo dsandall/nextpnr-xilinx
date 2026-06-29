@@ -100,8 +100,8 @@ void XC7Packer::pack_dsps()
             }
         };
 
-        if (ci->type == ctx->id("DSP48E1_DSP48E1")) {
-            all_dsps.push_back(ci);
+        if (ci->type == ctx->id("DSP48E1_DSP48E1") && !is_frozen(ci)) {
+            all_dsps.push_back(ci);   // frozen-gen DSP arrives placed+tied; don't re-process
             auto gnd_attr = ctx->id("DSP_GND_PINS");
             auto vcc_attr = ctx->id("DSP_VCC_PINS");
 

@@ -817,6 +817,8 @@ void XC7Packer::pack_bram()
     // These pins have no logical mapping, so must be tied after transformation
     for (auto cell : sorted(ctx->cells)) {
         CellInfo *ci = cell.second;
+        if (is_frozen(ci))
+            continue;   // frozen-gen BRAM arrives placed + port-tied; don't re-process
         if (ci->type == id_RAMB18E1_RAMB18E1) {
             int wwa = int_or_default(ci->params, ctx->id("WRITE_WIDTH_A"), 0);
             for (int i = ((wwa == 0) ? 0 : 2); i < 4; i++) {

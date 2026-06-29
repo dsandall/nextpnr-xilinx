@@ -638,6 +638,11 @@ bool Arch::isValidBelForCell(CellInfo *cell, BelId bel) const
 void Arch::fixupPlacement()
 {
     log_info("Running post-placement legalisation...\n");
+    // docs/93 Option 3: frozen-gen (.o) cells arrive BEL-legal + routed; their A6=VCC
+    // ties on 5LUT bels are stripped gen-side (freeze_gen §5c). Skip them here so post-
+    // place legalisation (LUT-input re-permutation, const re-tie, MUXF/FF/carry fixup)
+    // doesn't disconnect/reconnect frozen ports (which asserts and shatters reuse).
+    auto frz = [&](const CellInfo *c) { return c != nullptr && c->attrs.count(id("X_FROZEN")) != 0; };
     for (auto &ts : tileStatus) {
         if (ts.lts == nullptr)
             continue;
@@ -645,7 +650,7 @@ void Arch::fixupPlacement()
         for (int z = 0; z < 8; z++) {
             // Fixup LUT connectivity - applies whenever a LUT5 is used
             CellInfo *lut5 = lt.cells[z << 4 | BEL_5LUT];
-            if (lut5 == nullptr)
+            if (lut5 == nullptr || frz(lut5))
                 continue;
             std::unordered_map<IdString, std::vector<int>> lut5Inputs, lut6Inputs;
             for (int i = 0; i < lut5->lutInfo.input_count; i++)
@@ -730,6 +735,8 @@ void Arch::fixupPlacement()
     }
     for (auto cell : sorted(cells)) {
         CellInfo *ci = cell.second;
+        if (frz(ci))
+            continue;
         if (ci->type == id("PSS_ALTO_CORE")) {
             log_info("Tieing unused PSS inputs to constants...\n");
             for (IdString pname : getBelPins(ci->bel)) {
@@ -836,6 +843,9 @@ void Arch::fixupPlacement()
             for (int z = 0; z < 8; z++) {
                 CellInfo *lut5 = lts.cells[z << 4 | BEL_5LUT];
                 CellInfo *lut6 = lts.cells[z << 4 | BEL_6LUT];
+                if (frz(lut5) || frz(lut6) || frz(lts.cells[z << 4 | BEL_FF]) ||
+                    frz(lts.cells[z << 4 | BEL_FF2]))
+                    continue;   // frozen-gen slice: already legal + routed
                 NetInfo *i_net = nullptr, *x_net = nullptr;
                 // Check usage of DI and X inputs
                 if (lut6 != nullptr) {
