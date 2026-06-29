@@ -122,6 +122,11 @@ struct XilinxPacker
     void pack_lutffs();
 
     bool is_constrained(const CellInfo *cell);
+    // docs/93 Option 3: a cell imported from a frozen gen ".o" (carries the X_FROZEN
+    // attr) arrives already packed + placed (NEXTPNR_BEL) + routed (ROUTING_LOCS). The
+    // packer must NOT re-transform, re-cluster, feed-through, or re-tie it; the guarded
+    // passes skip frozen cells so only the checker is packed.
+    bool is_frozen(const CellInfo *cell) const { return cell->attrs.count(ctx->id("X_FROZEN")) != 0; }
     void pack_muxfs();
     void finalise_muxfs();
     void legalise_muxf_tree(CellInfo *curr, std::vector<CellInfo *> &mux_roots);

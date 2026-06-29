@@ -70,8 +70,8 @@ void XilinxPacker::split_carry4s()
 {
     for (auto cell : sorted(ctx->cells)) {
         CellInfo *ci = cell.second;
-        if (ci->type != ctx->id("CARRY4"))
-            continue;
+        if (ci->type != ctx->id("CARRY4") || is_frozen(ci))
+            continue;   // a frozen gen's CARRY4 arrives already placed; don't re-split it
         NetInfo *cin = get_net_or_empty(ci, ctx->id("CI"));
         if (cin == nullptr || cin->name == ctx->id("$PACKER_GND_NET")) {
             cin = get_net_or_empty(ci, ctx->id("CYINIT"));

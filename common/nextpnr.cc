@@ -689,6 +689,11 @@ void BaseCtx::attributesToArchInfo()
         // record is "wt,wi,pt,pi,strength;"; (pt,pi) < 0 marks a root/site-source wire.
         auto vloc = ni->attrs.find(id("ROUTING_LOCS"));
         if (vloc != ni->attrs.end()) {
+            // Mark REUSE so router2 makes these arcs YIELD under contention (docs/47):
+            // independently-P&R'd frozen gens can route onto the same shared global/long
+            // wires, so a colliding frozen arc must reroute AROUND rather than overuse.
+            // Harmless for a contention-free faithful round-trip (the router never rips).
+            ni->attrs[id("REUSE_NET")] = Property(1);
             const std::string s = vloc->second.as_string();
             size_t pos = 0;
             while (pos < s.size()) {

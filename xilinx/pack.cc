@@ -107,7 +107,7 @@ void XilinxPacker::generic_xform(const std::unordered_map<IdString, XFormRule> &
     std::map<std::string, int> new_types;
     for (auto cell : sorted(ctx->cells)) {
         CellInfo *ci = cell.second;
-        if (rules.count(ci->type)) {
+        if (rules.count(ci->type) && !is_frozen(ci)) {
             cell_count[ci->type.str(ctx)]++;
             xform_cell(rules, ci);
             new_types[ci->type.str(ctx)]++;
@@ -241,7 +241,7 @@ void XilinxPacker::pack_lutffs()
     int pairs = 0;
     for (auto cell : sorted(ctx->cells)) {
         CellInfo *ci = cell.second;
-        if (ci->constr_parent != nullptr || !ci->constr_children.empty())
+        if (ci->constr_parent != nullptr || !ci->constr_children.empty() || is_frozen(ci))
             continue;
         if (ci->type != id_SLICE_FFX)
             continue;
@@ -249,7 +249,7 @@ void XilinxPacker::pack_lutffs()
         if (d->driver.cell == nullptr || d->driver.cell->type != id_SLICE_LUTX || d->driver.port != id_O6)
             continue;
         CellInfo *lut = d->driver.cell;
-        if (lut->constr_parent != nullptr || !lut->constr_children.empty())
+        if (lut->constr_parent != nullptr || !lut->constr_children.empty() || is_frozen(lut))
             continue;
         lut->constr_children.push_back(ci);
         ci->constr_parent = lut;
