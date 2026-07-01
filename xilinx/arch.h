@@ -1186,22 +1186,37 @@ struct Arch : BaseCtx
     // router1's legality check requires every routed wire (incl. site wires) present.
     std::string getNetRoutingLocs(NetInfo *net) const
     {
-        // Reuse only the general INTER-TILE routing; drop DRIVEN site-internal wires
-        // (docs/47). LUT inputs are route-time PERMUTABLE (the router picks which
-        // physical A1..D6 pin a signal uses), so the standalone's pin choice differs
-        // from the bind's -- reusing those site hops made two reused nets collide on
-        // one LUT-input site wire. A site wire with a driving pip is an intermediate /
-        // sink site hop (e.g. a LUT input); drop it and let the bind re-route the short
-        // hop into the correctly-assigned pin. A site wire with NO driving pip is the
-        // net's root (the driver's own output) -- keep it. INT routing is all kept, so
-        // the expensive bulk is still reused. (Context is incomplete here, so the root
-        // is found by null pip, not getNetinfoSourceWire.)
+        // Reuse the general INTER-TILE routing PLUS the final LUT-input SINK pin, but drop
+        // the INTERMEDIATE site-internal (permutation-mux) wires (docs/47, docs/96). LUT
+        // inputs are route-time PERMUTABLE, and the faithful form claims the whole imux mux
+        // path -- two reused nets then collide on a shared mux site wire (docs/96: all 4832
+        // faithful-reuse overuses were SITEWIREs). But dropping ALL site hops (the old
+        // behaviour) un-pins the sink too, so a signal's re-routed last hop wanders onto a
+        // frozen CONSTANT's pin (the residual 66). Keeping the SINK site wire pins each net
+        // to its gen LUT-input pin (unique per net -> no collision) while the shared mux
+        // hops re-route fresh. Root/site-source wires (no driving pip) are kept as before.
+        // Sink wires = each user's LUT-input bel-pin wire (replicates Context::
+        // getNetinfoSinkWire with Arch-level getBelPinWire, since Context is incomplete here).
+        std::unordered_set<WireId> sink_wires;
+        for (auto &usr : net->users) {
+            BelId dst_bel = usr.cell->bel;
+            if (dst_bel == BelId())
+                continue;
+            IdString user_port = usr.port;
+            auto pit = usr.cell->pins.find(user_port);
+            if (pit != usr.cell->pins.end())
+                user_port = pit->second;
+            WireId sw = getBelPinWire(dst_bel, user_port);
+            if (sw != WireId())
+                sink_wires.insert(sw);
+        }
         std::string s;
         for (auto &it : net->wires) {
             WireId w = it.first;
             PipId p = it.second.pip;
-            if (p != PipId() && getWireName(w).str(this).compare(0, 9, "SITEWIRE/") == 0)
-                continue;
+            if (p != PipId() && getWireName(w).str(this).compare(0, 9, "SITEWIRE/") == 0 &&
+                !sink_wires.count(w))
+                continue;   // drop intermediate mux site hop; keep sink pin + INT + root
             // Root/site-source wire (p == PipId()) emits the explicit
             // ROUTING_LOC_ROOT_SENTINEL for (pt,pi); a real pip emits its own
             // {tile,index}. Bytes are identical to the old implicit form (-1,-1).

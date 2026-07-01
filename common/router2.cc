@@ -114,7 +114,15 @@ struct Router2
     Context *ctx;
     Router2Cfg cfg;
 
-    Router2(Context *ctx, const Router2Cfg &cfg) : ctx(ctx), cfg(cfg) {}
+    Router2(Context *ctx, const Router2Cfg &cfg) : ctx(ctx), cfg(cfg)
+    {
+        // docs/96: REUSE_NET yield penalty, tunable so cached routing seeds without forcing.
+        if (const char *p = getenv("SPIKE_REUSE_PENALTY"))
+            reuse_penalty = float(atof(p));
+    }
+
+    float reuse_penalty = 3.0f;   // 8x deadlocked dense-CPU reuse; 3x = seed-not-force default
+    int _overuse_seen = 0;        // SPIKE_DUMP_OVERUSE: iters with overuse seen, to dump once
 
     // Use 'udata' for fast net lookups and indexing
     std::vector<NetInfo *> nets_by_udata;
@@ -353,15 +361,16 @@ struct Router2
                                           ctx->getDelayEpsilon());
         float present_cost = present_wire_cost(wd, net->udata);
         float hist_cost = wd.hist_cong_cost;
-        // Split-flow option (c) (docs/47): a REUSED net YIELDS to fresh nets. It pays a
-        // stiff penalty to route onto a wire some OTHER net is already using, so when a
-        // reused arc is ripped under contention it reroutes AROUND the contested wire
-        // rather than ping-ponging back onto it (which left offchip_aes stuck at
-        // overuse=2 for 40k+ iters). The fresh net pays normal cost and wins the wire.
+        // Split-flow option (c) (docs/47): a REUSED net pays a penalty to route onto a wire
+        // some OTHER net already uses, so the cached routing SEEDS the design but the router
+        // is free to deviate under contention. Too stiff (8x) deadlocks dense CPUs whose
+        // reused const+signal routing collide on LUT-input site wires (docs/96) -- neither
+        // side wins. SPIKE_REUSE_PENALTY tunes it (default 3x: seeded but not forced). 1.0
+        // disables the yield entirely (pure PathFinder negotiation on the seeded routing).
         if (nd.is_reuse) {
             size_t others = wd.bound_nets.size() - (wd.bound_nets.count(net->udata) ? 1 : 0);
             if (others > 0)
-                present_cost *= 8.0f;
+                present_cost *= reuse_penalty;
         }
         float bias_cost = 0;
         int source_uses = 0;
@@ -995,6 +1004,38 @@ struct Router2
                 overused_wires += 1;
                 for (auto &bound : wire.bound_nets)
                     failed_nets.insert(bound.first);
+            }
+        }
+        // One-shot diagnostic (SPIKE_DUMP_OVERUSE=1, docs/96): once overuse is small+stable,
+        // categorise the overused wires (SITEWIRE vs INT) + their contending nets + reuse
+        // flags, so split-flow reuse contention is visible. Prints once then disables.
+        static bool _dumped = false;
+        if (!_dumped && overused_wires > 0 && getenv("SPIKE_DUMP_OVERUSE")) {
+            if (++_overuse_seen > 40) {
+                _dumped = true;
+                int nsite = 0, nint = 0, nfresh = 0, shown = 0;
+                for (auto &wire : flat_wires) {
+                    if (int(wire.bound_nets.size()) <= 1)
+                        continue;
+                    std::string wn = ctx->nameOfWire(wire.w);
+                    bool site = wn.find("SITEWIRE/") != std::string::npos;
+                    site ? ++nsite : ++nint;
+                    bool any_fresh = false;
+                    for (auto &b : wire.bound_nets)
+                        any_fresh |= !nets.at(b.first).is_reuse;
+                    if (any_fresh)
+                        ++nfresh;
+                    if (shown < 30) {
+                        std::string ns;
+                        for (auto &b : wire.bound_nets)
+                            ns += std::string(" ") + ctx->nameOf(nets_by_udata.at(b.first)) +
+                                  (nets.at(b.first).is_reuse ? "[r]" : "[FRESH]");
+                        log_info("  [dump] %s:%s\n", wn.c_str(), ns.c_str());
+                        ++shown;
+                    }
+                }
+                log_info("[SPIKE_DUMP_OVERUSE] %d overused wires: SITEWIRE=%d INT=%d, "
+                         "%d involve a FRESH net\n", overused_wires, nsite, nint, nfresh);
             }
         }
         for (int n : failed_nets) {
