@@ -289,6 +289,13 @@ struct Router2
         ArcBounds bb;
 
         DeterministicRNG rng;
+
+        // SPIKE_REUSE_DIAG counters: where do reused arcs go — pre-bound OK,
+        // backwards-merge into the seeded tree, or full forward A* (and how big)?
+        long dg_nets = 0, dg_arcs_ok = 0, dg_arcs_ripped = 0, dg_bwd_merge = 0;
+        long dg_astar_arcs = 0, dg_astar_iters = 0, dg_boom_logged = 0;
+        // why backwards merge fails: budget exhausted vs thread-bbox rejection
+        long dg_bwd_budget_out = 0, dg_bwd_ttw_skip = 0;
     };
 
     bool thread_test_wire(ThreadContext &t, PerWireData &w)
@@ -767,16 +774,21 @@ struct Router2
                     continue;
                 if (wd.bound_nets.size() > 1 || (wd.bound_nets.size() == 1 && !wd.bound_nets.count(net->udata)))
                     continue; // never allow congestion in backwards routing
-                if (!thread_test_wire(t, wd))
+                if (!thread_test_wire(t, wd)) {
+                    t.dg_bwd_ttw_skip++;
                     continue; // thread safety issue
+                }
                 t.backwards_queue.push(next);
                 set_visited(t, next, uh, WireScore());
             }
             if (did_something)
                 ++backwards_iter;
         }
+        if (!t.backwards_queue.empty() && backwards_iter >= backwards_limit)
+            t.dg_bwd_budget_out++;
         // Check if backwards routing succeeded in reaching source
         if (was_visited(src_wire_idx)) {
+            t.dg_bwd_merge++;
             ROUTE_LOG_DBG("   Routed (backwards): ");
             int cursor_fwd = src_wire_idx;
             bind_pip_internal(net, i, src_wire_idx, PipId());
@@ -798,6 +810,7 @@ struct Router2
         }
 
         // Normal forwards A* routing
+        t.dg_astar_arcs++;
         reset_wires(t);
         WireScore base_score;
         base_score.cost = 0;
@@ -825,6 +838,8 @@ struct Router2
         // because there is not route, rather than just because the toexplore
         // heuristic is incorrect.
         bool must_drain_queue = !is_bb;
+        // SPIKE_REUSE_DIAG: per-rejection-reason counters for this arc's A*.
+        long rj_bb = 0, rj_pip = 0, rj_unavail = 0, rj_reserved = 0, rj_ownpip = 0, rj_ttw = 0;
         while (!t.queue.empty() && (must_drain_queue || iter < toexplore)) {
             auto curr = t.queue.top();
             auto &d = flat_wires.at(curr.wire);
@@ -844,10 +859,14 @@ struct Router2
                 if (is_bb && !hit_test_pip(ad.bb, ctx->getPipLocation(dh)) && wire_intent != ID_PSEUDO_GND && wire_intent != ID_PSEUDO_VCC)
                     continue;
 #else
-                if (is_bb && !hit_test_pip(nd.bb, ctx->getPipLocation(dh)))
+                if (is_bb && !hit_test_pip(nd.bb, ctx->getPipLocation(dh))) {
+                    rj_bb++;
                     continue;
-                if (!ctx->checkPipAvail(dh) && ctx->getBoundPipNet(dh) != net)
+                }
+                if (!ctx->checkPipAvail(dh) && ctx->getBoundPipNet(dh) != net) {
+                    rj_pip++;
                     continue;
+                }
 #endif
                 // Evaluate score of next wire
                 WireId next = ctx->getPipDstWire(dh);
@@ -859,14 +878,22 @@ struct Router2
                     ROUTE_LOG_DBG("   src wire %s\n", ctx->nameOfWire(next));
 #endif
                 auto &nwd = flat_wires.at(next_idx);
-                if (nwd.unavailable)
+                if (nwd.unavailable) {
+                    rj_unavail++;
                     continue;
-                if (nwd.reserved_net != -1 && nwd.reserved_net != net->udata)
+                }
+                if (nwd.reserved_net != -1 && nwd.reserved_net != net->udata) {
+                    rj_reserved++;
                     continue;
-                if (nwd.bound_nets.count(net->udata) && nwd.bound_nets.at(net->udata).second != dh)
+                }
+                if (nwd.bound_nets.count(net->udata) && nwd.bound_nets.at(net->udata).second != dh) {
+                    rj_ownpip++;
                     continue;
-                if (!thread_test_wire(t, nwd))
+                }
+                if (!thread_test_wire(t, nwd)) {
+                    rj_ttw++;
                     continue; // thread safety issue
+                }
                 WireScore next_score;
                 next_score.cost = curr.score.cost + score_wire_for_arc(net, i, next, dh);
                 next_score.delay =
@@ -888,6 +915,19 @@ struct Router2
                     }
                 }
             }
+        }
+        t.dg_astar_iters += iter;
+        // SPIKE_REUSE_DIAG: name the exploding arcs (first few per thread) — which
+        // net class pays the huge A*s, and between which wires.
+        static const bool dg_on = getenv("SPIKE_REUSE_DIAG") != nullptr;
+        if (dg_on && iter > 20000 && t.dg_boom_logged < 8) {
+            t.dg_boom_logged++;
+            log_info("[reuse-diag] BOOM net=%s arc=%d iters=%d explored=%d src=%s dst=%s reuse=%d "
+                     "rej{bb=%ld pip=%ld unavail=%ld resv=%ld ownpip=%ld ttw=%ld}\n",
+                     ctx->nameOf(net), int(i), iter, explored,
+                     ctx->nameOfWire(ctx->getNetinfoSourceWire(net)), ctx->nameOfWire(dst_wire),
+                     int(nets.at(net->udata).is_reuse), rj_bb, rj_pip, rj_unavail, rj_reserved,
+                     rj_ownpip, rj_ttw);
         }
         if (was_visited(dst_wire_idx)) {
             ROUTE_LOG_DBG("   Routed (explored %d wires): ", explored);
@@ -914,6 +954,11 @@ struct Router2
             reset_wires(t);
             return ARC_SUCCESS;
         } else {
+            if (!is_bb)   // unbounded retry exhausted: name what rejected the frontier
+                log_info("[fail-diag] arc %d of %s: A* drained after %d iters; "
+                         "rej{bb=%ld pip=%ld unavail=%ld resv=%ld ownpip=%ld ttw=%ld}\n",
+                         int(i), ctx->nameOf(net), iter, rj_bb, rj_pip, rj_unavail,
+                         rj_reserved, rj_ownpip, rj_ttw);
             reset_wires(t);
             return ARC_RETRY_WITHOUT_BB;
         }
@@ -953,6 +998,9 @@ struct Router2
             ripup_arc(net, i);
             t.route_arcs.push_back(i);
         }
+        t.dg_nets++;
+        t.dg_arcs_ripped += long(t.route_arcs.size());
+        t.dg_arcs_ok += long(net->users.size()) - long(t.route_arcs.size());
         for (auto i : t.route_arcs) {
             auto res1 = route_arc(t, net, i, is_mt, true);
             if (res1 == ARC_FATAL)
@@ -967,10 +1015,37 @@ struct Router2
                                   int(i), ctx->nameOf(net));
                     auto res2 = route_arc(t, net, i, is_mt, false);
                     // If this also fails, no choice but to give up
-                    if (res2 != ARC_SUCCESS)
+                    if (res2 != ARC_SUCCESS) {
+                        // Forensics before dying: who owns the sink wire and every pip
+                        // into it? (split-flow reuse: a frozen net hard-binding the
+                        // sink's entry pip is invisible in the normal error.)
+                        WireId dw = ctx->getNetinfoSinkWire(net, net->users.at(i));
+                        for (auto bn : wire_data(dw).bound_nets)
+                            log_info("  [fail-diag] sink wire bound by net %s\n",
+                                     ctx->nameOf(nets_by_udata.at(bn.first)));
+                        for (auto uh : ctx->getPipsUphill(dw)) {
+                            NetInfo *own = ctx->getBoundPipNet(uh);
+                            log_info("  [fail-diag] uphill pip %s avail=%d bound=%s\n", ctx->nameOfPip(uh),
+                                     int(ctx->checkPipAvail(uh)), own ? ctx->nameOf(own) : "-");
+                        }
+                        // Source side: can the arc even leave the driver pin?
+                        WireId sw = ctx->getNetinfoSourceWire(net);
+                        log_info("  [fail-diag] net has %d bound wires; src bound to net: %d\n",
+                                 int(net->wires.size()), int(net->wires.count(sw)));
+                        for (auto bn : wire_data(sw).bound_nets)
+                            log_info("  [fail-diag] SRC wire bound by net %s\n",
+                                     ctx->nameOf(nets_by_udata.at(bn.first)));
+                        for (auto dh : ctx->getPipsDownhill(sw)) {
+                            NetInfo *own = ctx->getBoundPipNet(dh);
+                            log_info("  [fail-diag] src downhill pip %s avail=%d hard_unavail=%d bound=%s -> %s\n",
+                                     ctx->nameOfPip(dh), int(ctx->checkPipAvail(dh)),
+                                     int(ctx->usp_pip_hard_unavail(dh)), own ? ctx->nameOf(own) : "-",
+                                     ctx->nameOfWire(ctx->getPipDstWire(dh)));
+                        }
                         log_error("Failed to route arc %d of net '%s', from %s to %s.\n", int(i), ctx->nameOf(net),
                                   ctx->nameOfWire(ctx->getNetinfoSourceWire(net)),
                                   ctx->nameOfWire(ctx->getNetinfoSinkWire(net, net->users.at(i))));
+                    }
                 }
             }
         }
@@ -1242,11 +1317,23 @@ struct Router2
 
     void router_thread(ThreadContext &t)
     {
+        // SPIKE_REUSE_DIAG: one-line running account of where arcs go (pre-bound OK /
+        // backwards-merge / forward A* + its total explored iters) — the reuse-stitch
+        // fast path vs the per-arc A* explosion are indistinguishable in the normal log.
+        static const bool diag = getenv("SPIKE_REUSE_DIAG") != nullptr;
         for (auto n : t.route_nets) {
             bool result = route_net(t, n, true);
             if (!result)
                 t.failed_nets.push_back(n);
+            if (diag && (t.dg_nets % 500) == 0)
+                log_info("[reuse-diag] nets=%ld arcs_ok=%ld ripped=%ld bwd_merge=%ld astar_arcs=%ld astar_iters=%ld bwd_budget_out=%ld bwd_ttw=%ld\n",
+                         t.dg_nets, t.dg_arcs_ok, t.dg_arcs_ripped, t.dg_bwd_merge, t.dg_astar_arcs, t.dg_astar_iters,
+                         t.dg_bwd_budget_out, t.dg_bwd_ttw_skip);
         }
+        if (diag)
+            log_info("[reuse-diag] FINAL nets=%ld arcs_ok=%ld ripped=%ld bwd_merge=%ld astar_arcs=%ld astar_iters=%ld bwd_budget_out=%ld bwd_ttw=%ld\n",
+                     t.dg_nets, t.dg_arcs_ok, t.dg_arcs_ripped, t.dg_bwd_merge, t.dg_astar_arcs, t.dg_astar_iters,
+                     t.dg_bwd_budget_out, t.dg_bwd_ttw_skip);
     }
 
     void do_route()
