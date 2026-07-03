@@ -353,7 +353,13 @@ struct Router2
         WireId cursor = ad.sink_wire;
         while (cursor != src) {
             auto &wd = wire_data(cursor);
-            PipId pip = wd.bound_nets.at(net->udata).second;
+            // Harden (docs/102 follow-up): a routed-marked chain whose wire is not bound to
+            // this net in bound_nets (seed diverged from arch pip topology) must not abort —
+            // stop unwinding gracefully; the arc is treated as ripped and re-routed.
+            auto fnd = wd.bound_nets.find(net->udata);
+            if (fnd == wd.bound_nets.end())
+                break;
+            PipId pip = fnd->second.second;
             unbind_pip_internal(net, user, cursor);
             cursor = ctx->getPipSrcWire(pip);
         }
@@ -997,7 +1003,13 @@ struct Router2
             // below to fail gracefully (re-route) instead of aborting if the seeded chain
             // and the arch pip topology diverge.
             if (check_arc_routing(net, i)) {
-                nets.at(net->udata).arcs.at(i).routed = true;
+                // Only mark a REUSE-seed arc routed (that is the case docs/102 targets: keep
+                // the preserved flat_wires chain so bind_and_check_all commits it). A
+                // from-scratch arc that merely re-passes this check across router2 iterations
+                // must NOT be marked routed here — doing so drove ripup_arc's bound_nets.at()
+                // to abort mid-route on dense gens (design-desktop repro; parent 275f2909 fine).
+                if (nets.at(net->udata).is_reuse)
+                    nets.at(net->udata).arcs.at(i).routed = true;
                 continue;
             }
             auto &usr = net->users.at(i);

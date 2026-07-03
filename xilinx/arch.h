@@ -1210,17 +1210,61 @@ struct Arch : BaseCtx
             if (sw != WireId())
                 sink_wires.insert(sw);
         }
+        // SOURCE CONE (docs/99 §8 runtime fix): also keep the site wires between the
+        // source bel pin (the root) and the tile fabric (A/BMUX/COUT port wires etc.).
+        // They are single-net (output paths have no permutation contention), and
+        // dropping them broke the reloaded chain ONE hop short of the source — which
+        // made check_arc_routing fail for EVERY arc of the net and forced a
+        // backwards-BFS stitch per sink (the bulk of the reuse-vs-placement overhead).
+        std::unordered_set<WireId> kept_src;
+        {
+            bool grew = true;
+            while (grew) {
+                grew = false;
+                for (auto &it : net->wires) {
+                    if (it.second.pip == PipId() || kept_src.count(it.first))
+                        continue;
+                    if (getWireName(it.first).str(this).compare(0, 9, "SITEWIRE/") != 0)
+                        continue;
+                    WireId sw = getPipSrcWire(it.second.pip);
+                    auto swit = net->wires.find(sw);
+                    bool src_ok = kept_src.count(sw) ||
+                                  (swit != net->wires.end() && swit->second.pip == PipId());
+                    if (src_ok) {
+                        kept_src.insert(it.first);
+                        grew = true;
+                    }
+                }
+            }
+        }
         std::string s;
         for (auto &it : net->wires) {
             WireId w = it.first;
             PipId p = it.second.pip;
             if (p != PipId() && getWireName(w).str(this).compare(0, 9, "SITEWIRE/") == 0 &&
-                !sink_wires.count(w))
-                continue;   // drop intermediate mux site hop; keep sink pin + INT + root
+                !sink_wires.count(w) && !kept_src.count(w))
+                continue;   // drop intermediate mux site hop; keep sink pin + INT + root + src cone
             // Root/site-source wire (p == PipId()) emits the explicit
             // ROUTING_LOC_ROOT_SENTINEL for (pt,pi); a real pip emits its own
             // {tile,index}. Bytes are identical to the old implicit form (-1,-1).
             appendRoutingLoc(s, w.tile, w.index, p);
+        }
+        // SINK REMAP (docs/99 §8): fixupRouting rewires PERMUTED LUT inputs to their
+        // physical ports but leaves the bound chain ending at the OLD logical pin's
+        // site wire via the permutation pip — so the CURRENT sink wire (per the
+        // post-fixup pin map) is not in net->wires at all, and the reloaded arc looks
+        // unrouted. Serialize the one-hop entry (sink wire + the pip from a wire we
+        // already carry, i.e. the identity permutation pip off the bound tile wire) so
+        // the reloaded chain terminates at the real sink and verifies outright.
+        for (WireId sw : sink_wires) {
+            if (net->wires.count(sw))
+                continue;              // already bound + serialized above
+            for (auto p : getPipsUphill(sw)) {
+                if (net->wires.count(getPipSrcWire(p))) {
+                    appendRoutingLoc(s, sw.tile, sw.index, p);
+                    break;
+                }
+            }
         }
         return s;
     }

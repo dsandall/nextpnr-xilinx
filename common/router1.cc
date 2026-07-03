@@ -111,6 +111,9 @@ struct Router1
     int arcs_without_ripup = 0;
     bool ripup_flag;
 
+    // SPIKE_REUSE_DIAG (docs/101 task #2): setup() arc-preservation accounting.
+    long spk_preserved = 0, spk_q_sink_unbound = 0, spk_q_chain_break = 0, spk_q_samples = 0;
+
     Router1(Context *ctx, const Router1Cfg &cfg) : ctx(ctx), cfg(cfg) {}
 
     void arc_queue_insert(const arc_key &arc, WireId src_wire, WireId dst_wire)
@@ -400,7 +403,21 @@ struct Router1
 
                 dst_to_arc[dst_wire] = arc;
 
+                // SPIKE_REUSE_DIAG (docs/101 task #2): why does the post-router2 router1
+                // check re-route this arc instead of preserving it? Two failure modes —
+                // the sink wire isn't bound at all, or the sink→source chain breaks at
+                // some intermediate wire (log its class). Preserved arcs cost ~nothing;
+                // the goal is to make router2's handoff leave chains router1 can trace.
+                static const bool spk_diag = getenv("SPIKE_REUSE_DIAG") != nullptr;
                 if (net_info->wires.count(dst_wire) == 0) {
+                    if (spk_diag) {
+                        ++spk_q_sink_unbound;
+                        if (spk_q_samples < 12) {
+                            ++spk_q_samples;
+                            log_info("[r1-diag] QUEUE(sink-unbound) net=%s sink=%s\n",
+                                     ctx->nameOf(net_info), ctx->nameOfWire(dst_wire));
+                        }
+                    }
                     arc_queue_insert(arc, src_wire, dst_wire);
                     continue;
                 }
@@ -409,9 +426,20 @@ struct Router1
                 wire_to_arcs[cursor].insert(arc);
                 arc_to_wires[arc].insert(cursor);
 
+                bool spk_broke = false;
                 while (src_wire != cursor) {
                     auto it = net_info->wires.find(cursor);
                     if (it == net_info->wires.end()) {
+                        if (spk_diag) {
+                            ++spk_q_chain_break;
+                            if (spk_q_samples < 12) {
+                                ++spk_q_samples;
+                                log_info("[r1-diag] QUEUE(chain-break) net=%s broke-at=%s sink=%s\n",
+                                         ctx->nameOf(net_info), ctx->nameOfWire(cursor),
+                                         ctx->nameOfWire(dst_wire));
+                            }
+                        }
+                        spk_broke = true;
                         arc_queue_insert(arc, src_wire, dst_wire);
                         break;
                     }
@@ -421,6 +449,8 @@ struct Router1
                     wire_to_arcs[cursor].insert(arc);
                     arc_to_wires[arc].insert(cursor);
                 }
+                if (spk_diag && !spk_broke)
+                    ++spk_preserved;
             }
 
             src_to_net[src_wire] = net_info;
@@ -436,6 +466,13 @@ struct Router1
                     log_info("   setup unbinding wire %s\n", ctx->nameOfWire(it));
                 ctx->unbindWire(it);
             }
+        }
+        if (getenv("SPIKE_REUSE_DIAG") != nullptr) {
+            long total = spk_preserved + spk_q_sink_unbound + spk_q_chain_break;
+            log_info("[r1-diag] setup: %ld arcs | preserved=%ld (%.1f%%) "
+                     "queued: sink-unbound=%ld chain-break=%ld\n",
+                     total, spk_preserved, total ? 100.0 * spk_preserved / total : 0.0,
+                     spk_q_sink_unbound, spk_q_chain_break);
         }
     }
 
