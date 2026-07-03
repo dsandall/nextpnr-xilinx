@@ -295,7 +295,7 @@ struct Router2
         long dg_nets = 0, dg_arcs_ok = 0, dg_arcs_ripped = 0, dg_bwd_merge = 0;
         long dg_astar_arcs = 0, dg_astar_iters = 0, dg_boom_logged = 0;
         // why backwards merge fails: budget exhausted vs thread-bbox rejection
-        long dg_bwd_budget_out = 0, dg_bwd_ttw_skip = 0;
+        long dg_bwd_budget_out = 0, dg_bwd_ttw_skip = 0, dg_chain_logged = 0;
     };
 
     bool thread_test_wire(ThreadContext &t, PerWireData &w)
@@ -987,8 +987,19 @@ struct Router2
         for (size_t i = 0; i < net->users.size(); i++) {
             // Ripup failed arcs to start with
             // Check if arc is already legally routed
-            if (check_arc_routing(net, i))
+            // docs/101 §task2 / docs/102 (FIXED): an arc preserved here from the reuse
+            // seed has a valid, uncontended flat_wires chain to the source — it IS routed.
+            // Historically ad.routed stayed false, so bind_and_check's `!ad.routed`
+            // early-out returned success WITHOUT binding → the reused sink landed UNBOUND
+            // and the trailing router1 re-routed it (measured on frozen riscv reuse: router1
+            // = 3380 arcs / 20.37s, 75% of nextpnr). Mark it routed so bind_and_check_all
+            // commits the flat_wires chain into the Arch API; bind_and_check is hardened
+            // below to fail gracefully (re-route) instead of aborting if the seeded chain
+            // and the arch pip topology diverge.
+            if (check_arc_routing(net, i)) {
+                nets.at(net->udata).arcs.at(i).routed = true;
                 continue;
+            }
             auto &usr = net->users.at(i);
             WireId dst_wire = ctx->getNetinfoSinkWire(net, usr);
             // Case of arcs that were pre-routed strongly (e.g. clocks)
@@ -1001,6 +1012,33 @@ struct Router2
         t.dg_nets++;
         t.dg_arcs_ripped += long(t.route_arcs.size());
         t.dg_arcs_ok += long(net->users.size()) - long(t.route_arcs.size());
+        // SPIKE_REUSE_DIAG: for the first few RIPPED arcs of reuse nets, walk the
+        // bound chain again and log WHERE it stopped (the missing-link wire class):
+        // is the seed failing at the source-side site hop, a sink-side hop, or a
+        // multi-bound wire? This decides what getNetRoutingLocs should also keep.
+        static const bool dg_on2 = getenv("SPIKE_REUSE_DIAG") != nullptr;
+        if (dg_on2 && nets.at(net->udata).is_reuse && !t.route_arcs.empty() &&
+            t.dg_chain_logged < 12) {
+            t.dg_chain_logged++;
+            size_t i0 = t.route_arcs.front();
+            WireId src_wire = nets.at(net->udata).src_wire;
+            WireId cursor = nets.at(net->udata).arcs.at(i0).sink_wire;
+            int hops = 0;
+            bool multi = false;
+            while (wire_data(cursor).bound_nets.count(net->udata)) {
+                auto &wd = wire_data(cursor);
+                if (wd.bound_nets.size() != 1) { multi = true; break; }
+                auto &uh = wd.bound_nets.at(net->udata).second;
+                if (uh == PipId())
+                    break;
+                cursor = ctx->getPipSrcWire(uh);
+                hops++;
+            }
+            log_info("[reuse-diag] CHAINSTOP net=%s arc=%d hops=%d multi=%d stop=%s src=%s sink_bound=%d\n",
+                     ctx->nameOf(net), int(i0), hops, int(multi), ctx->nameOfWire(cursor),
+                     ctx->nameOfWire(src_wire),
+                     int(wire_data(nets.at(net->udata).arcs.at(i0).sink_wire).bound_nets.count(net->udata)));
+        }
         for (auto i : t.route_arcs) {
             auto res1 = route_arc(t, net, i, is_mt, true);
             if (res1 == ARC_FATAL)
@@ -1176,9 +1214,16 @@ struct Router2
             }
             auto &wd = wire_data(cursor);
             if (!wd.bound_nets.count(net->udata)) {
-                log("Failure details:\n");
-                log("    Cursor: %s\n", ctx->nameOfWire(cursor));
-                log_error("Internal error; incomplete route tree for arc %d of net %s.\n", usr_idx, ctx->nameOf(net));
+                // docs/101 §task2: for a committed-from-reuse chain the flat_wires seed and
+                // the arch getPipSrcWire topology can legitimately diverge at a wire the seed
+                // never bound for this net. Rather than aborting the whole router (this used
+                // to be a fatal log_error), treat the arc as uncommittable: fail gracefully
+                // so it is ripped and re-routed fresh next iteration.
+                if (ctx->debug)
+                    log("  reuse-commit: chain diverged at %s for arc %d of %s; re-routing\n",
+                        ctx->nameOfWire(cursor), usr_idx, ctx->nameOf(net));
+                success = false;
+                break;
             }
             auto &p = wd.bound_nets.at(net->udata).second;
             if (!ctx->checkPipAvail(p)) {
@@ -1481,6 +1526,10 @@ struct Router2
             route_queue.push_back(i);
 
         timing_driven = ctx->setting<bool>("timing_driven");
+        // Did the final iteration's bind_and_check_all commit every arc into the Arch API
+        // without a failure? If so, the trailing router1 pass enqueues nothing (see the
+        // finalCheck handling after the loop) and can be skipped.
+        bool last_bind_ok = false;
         log_info("Running main router loop...\n");
         do {
             ctx->sorted_shuffle(route_queue);
@@ -1526,7 +1575,9 @@ struct Router2
 
             if (overused_wires == 0) {
                 // Try and actually bind nextpnr Arch API wires
-                bind_and_check_all();
+                last_bind_ok = bind_and_check_all();
+            } else {
+                last_bind_ok = false;
             }
             for (auto cn : failed_nets)
                 route_queue.push_back(cn);
@@ -1552,9 +1603,43 @@ struct Router2
         auto rend = std::chrono::high_resolution_clock::now();
         log_info("Router2 time %.02fs\n", std::chrono::duration<float>(rend - rstart).count());
 
-        log_info("Running router1 to check that route is legal...\n");
+        // Final legality handling (docs/102). Historically router2 always re-ran the full
+        // router1 (setup() re-walk of every arc + maze-reroute of any stragglers + a full
+        // STA). When router2's own arch bind already succeeded for every arc (last_bind_ok),
+        // router1 enqueues zero arcs, so its re-route is pure overhead — but it is also the
+        // ONLY timing_analysis() in the routing flow (xilinx route() runs none), so STA must
+        // still be produced when we skip it. On the reuse path this is the big win: without
+        // the reuse-commit above, router1 re-routes the preserved reuse arcs (frozen riscv:
+        // 3380 arcs / 20.37s); with it the bind is clean and router1 is skippable.
+        //   SPIKE_FINAL_CHECK env: unset/auto/0 = skip router1 when the arch bind is clean,
+        //   else run it; always/1 = legacy (always full router1); verify/2 = clean bind runs
+        //   checkRoutedDesign() instead of the full router1.
+        const char *fc_env = getenv("SPIKE_FINAL_CHECK");
+        std::string fc = fc_env ? fc_env : "";
+        int final_check = 0; // auto
+        if (fc == "1" || fc == "always")
+            final_check = 1;
+        else if (fc == "2" || fc == "verify")
+            final_check = 2;
+        bool bind_clean = last_bind_ok && overused_wires == 0;
 
-        router1(ctx, Router1Cfg(ctx));
+        if (final_check == 1 || !bind_clean) {
+            log_info("Running router1 to check that route is legal...\n");
+            router1(ctx, Router1Cfg(ctx));
+        } else {
+            if (final_check == 2) {
+                log_info("Router2 arch bind clean; verifying via checkRoutedDesign "
+                         "(skipping router1 re-route)...\n");
+                if (!ctx->checkRoutedDesign())
+                    log_error("Post-router2 legality verification failed despite a clean arch bind\n");
+            } else {
+                log_info("Router2 arch bind clean (overused=0, final bind_and_check_all ok); "
+                         "skipping router1 legality re-route.\n");
+            }
+            // Preserve the STA that the router1 tail would otherwise have produced.
+            timing_analysis(ctx, true /* slack_histogram */, true /* print_fmax */, true /* print_path */,
+                            true /* warn_on_failure */);
+        }
     }
 };
 } // namespace
