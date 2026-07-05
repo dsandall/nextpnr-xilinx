@@ -680,6 +680,9 @@ void BaseCtx::attributesToArchInfo()
             }
         }
     }
+#ifdef ARCH_XILINX
+    int reuse_conflict_nets = 0;
+#endif
     for (auto &net : getCtx()->nets) {
         auto ni = net.second.get();
 #ifdef ARCH_XILINX
@@ -689,26 +692,72 @@ void BaseCtx::attributesToArchInfo()
         // record is "wt,wi,pt,pi,strength;"; (pt,pi) < 0 marks a root/site-source wire.
         auto vloc = ni->attrs.find(id("ROUTING_LOCS"));
         if (vloc != ni->attrs.end()) {
+            const std::string s = vloc->second.as_string();
+            struct LocEntry
+            {
+                int wt, wi, pt, pi, st;
+            };
+            std::vector<LocEntry> entries;
+            size_t pos = 0;
+            while (pos < s.size()) {
+                LocEntry e{};
+                if (std::sscanf(s.c_str() + pos, "%d,%d,%d,%d,%d", &e.wt, &e.wi, &e.pt, &e.pi, &e.st) != 5)
+                    break;
+                entries.push_back(e);
+                size_t semi = s.find(';', pos);
+                if (semi == std::string::npos)
+                    break;
+                pos = semi + 1;
+            }
+            // Precheck before binding anything: independently-P&R'd frozen gens can land
+            // on the same canonical node (xc7 wires are multi-tile nodes -- long LV/LH
+            // wires cross region boundaries), so two gens' dumped arcs may claim one dst
+            // wire even with zero raw {tile,index} overlap (shortshift docs/123). bindPip
+            // hard-asserts on that, so a net whose locs conflict with an already-bound
+            // net DROPS its reuse entirely and routes fresh -- never a partial bind (a
+            // skipped arc would orphan its downstream subtree).
+            const NetInfo *owner = nullptr;
+            for (const auto &e : entries) {
+                if (e.pt < 0) {
+                    WireId w;
+                    w.tile = e.wt;
+                    w.index = e.wi; // roots were dumped canonical (net->wires keys)
+                    NetInfo *o = getCtx()->getBoundWireNet(w);
+                    if (o && o != ni) {
+                        owner = o;
+                        break;
+                    }
+                } else {
+                    PipId p;
+                    p.tile = e.pt;
+                    p.index = e.pi;
+                    NetInfo *po = getCtx()->getBoundPipNet(p);
+                    NetInfo *wo = getCtx()->getBoundWireNet(getCtx()->getPipDstWire(p));
+                    if ((po && po != ni) || (wo && wo != ni)) {
+                        owner = po && po != ni ? po : wo;
+                        break;
+                    }
+                }
+            }
+            if (owner) {
+                reuse_conflict_nets++;
+                if (reuse_conflict_nets <= 10)
+                    log_warning("reuse locs conflict: net '%s' overlaps net '%s' already bound from its "
+                                "locs; dropping this net's reused routing (will route fresh)\n",
+                                nameOf(ni), nameOf(owner));
+                continue; // no REUSE_NET mark either -- it's a plain fresh net now
+            }
             // Mark REUSE so router2 makes these arcs YIELD under contention (docs/47):
             // independently-P&R'd frozen gens can route onto the same shared global/long
             // wires, so a colliding frozen arc must reroute AROUND rather than overuse.
             // Harmless for a contention-free faithful round-trip (the router never rips).
             ni->attrs[id("REUSE_NET")] = Property(1);
-            const std::string s = vloc->second.as_string();
-            size_t pos = 0;
-            while (pos < s.size()) {
-                int wt = 0, wi = 0, pt = 0, pi = 0, st = 0;
-                if (std::sscanf(s.c_str() + pos, "%d,%d,%d,%d,%d", &wt, &wi, &pt, &pi, &st) != 5)
-                    break;
-                PlaceStrength strength = (PlaceStrength)st;
-                if (pt < 0)
-                    getCtx()->bindWireByLoc(wt, wi, ni, strength); // root / site-source wire
+            for (const auto &e : entries) {
+                PlaceStrength strength = (PlaceStrength)e.st;
+                if (e.pt < 0)
+                    getCtx()->bindWireByLoc(e.wt, e.wi, ni, strength); // root / site-source wire
                 else
-                    getCtx()->bindPipByLoc(pt, pi, ni, strength);  // binds the pip's dst wire too
-                size_t semi = s.find(';', pos);
-                if (semi == std::string::npos)
-                    break;
-                pos = semi + 1;
+                    getCtx()->bindPipByLoc(e.pt, e.pi, ni, strength); // binds the pip's dst wire too
             }
             continue; // bound from locs; skip the (broken-on-xilinx) name path below
         }
@@ -729,6 +778,12 @@ void BaseCtx::attributesToArchInfo()
             }
         }
     }
+#ifdef ARCH_XILINX
+    if (reuse_conflict_nets > 0)
+        log_warning("reuse locs: dropped cached routing for %d net(s) whose locs conflict with "
+                    "already-bound nets (cross-gen shared-node overlap); they route fresh\n",
+                    reuse_conflict_nets);
+#endif
     getCtx()->assignArchInfo();
 }
 
