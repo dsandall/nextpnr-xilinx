@@ -382,6 +382,10 @@ class HeAPPlacer
         const char *p = getenv("SPIKE_FUZZY_BREAKAWAY");
         return p ? atof(p) : 0.5;
     }();
+    int fuzzy_break_budget = [] {
+        const char *p = getenv("SPIKE_FUZZY_MAX_BREAKS");
+        return p ? atoi(p) : 8;
+    }();
 
     // The offset from chain_root to a cell in the chain
     std::unordered_map<IdString, std::pair<int, int>> cell_offsets;
@@ -857,20 +861,38 @@ class HeAPPlacer
     // exceeds the threshold: unbind, unlock, join place_cells — fully free from here.
     void fuzzy_breakaway_check()
     {
-        if (fuzzy_stuck.empty())
+        if (fuzzy_stuck.empty() || fuzzy_break_budget <= 0)
             return;
-        std::vector<CellInfo *> broke;
+        std::vector<std::pair<double, CellInfo *>> over;
         for (auto &fs : fuzzy_stuck) {
             double fx = fuzzy_pull(fs.first, fs.second, false);
             double fy = fuzzy_pull(fs.first, fs.second, true);
             double f = std::max(std::abs(fx), std::abs(fy));
-            if (f > fuzzy_breakaway) {
-                log_info("fuzzy: friction broken on '%s' (pull %.3f > %.3f) — placing freely\n",
-                         ctx->nameOf(fs.first), f, fuzzy_breakaway);
-                broke.push_back(fs.first);
-            } else if (ctx->debug) {
+            if (f > fuzzy_breakaway)
+                over.emplace_back(f, fs.first);
+            else if (ctx->debug)
                 log_info("fuzzy: '%s' holds (pull %.3f <= %.3f)\n", ctx->nameOf(fs.first), f, fuzzy_breakaway);
+        }
+        // BREAKAWAY BUDGET (docs/126 sweep finding): pass/fail tracks the ABSOLUTE
+        // number of breakaways, not hops/threshold — ≤10 breaks routed everywhere
+        // tested, 80+ always route-failed (aes_gen's 128-bit boundary broke 80 cells
+        // even at threshold 1.0). Only the strongest pulls may break, budgeted across
+        // the whole placement (SPIKE_FUZZY_MAX_BREAKS, default 8); the rest hold and
+        // keep their cached routing.
+        std::sort(over.begin(), over.end(),
+                  [](const std::pair<double, CellInfo *> &a, const std::pair<double, CellInfo *> &b) {
+                      return a.first > b.first;
+                  });
+        int skipped = 0;
+        std::vector<CellInfo *> broke;
+        for (auto &fc : over) {
+            if (int(broke.size()) >= fuzzy_break_budget) {
+                skipped = int(over.size()) - int(broke.size());
+                break;
             }
+            log_info("fuzzy: friction broken on '%s' (pull %.3f > %.3f) — placing freely\n",
+                     ctx->nameOf(fc.second), fc.first, fuzzy_breakaway);
+            broke.push_back(fc.second);
         }
         for (CellInfo *ci : broke) {
             fuzzy_stuck.erase(ci);
@@ -879,9 +901,11 @@ class HeAPPlacer
             cell_locs[ci->name].locked = false;
             place_cells.push_back(ci);
         }
-        if (!broke.empty())
-            log_info("fuzzy: friction summary: %d broke away, %d still holding\n", int(broke.size()),
-                     int(fuzzy_stuck.size()));
+        fuzzy_break_budget -= int(broke.size());
+        if (!broke.empty() || skipped)
+            log_info("fuzzy: friction summary: %d broke away, %d over-threshold held (budget), "
+                     "%d holding, budget left %d\n",
+                     int(broke.size()), skipped, int(fuzzy_stuck.size()), fuzzy_break_budget);
     }
 
     // Build the system of equations for either X or Y
