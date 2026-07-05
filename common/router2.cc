@@ -139,8 +139,9 @@ struct Router2
     int ripup_depth = -1;         // docs/125: tiles from gen bbox edge that stay squishy; <0 = off
     float edge_penalty = 1.0f;    // docs/125: penalty for reused arcs within ripup_depth of the edge
     bool livelock_break = false;  // docs/126: net-level yield escalation for stuck tiny overuse
-    int livelock_stuck = 0;       // consecutive iters with 0 < overused_wires <= 8
+    int livelock_stuck = 0;       // consecutive iters with an UNCHANGED tiny overused set
     int livelock_rounds = 0;      // firings since overuse last hit 0 (round 2+ rips fresh too)
+    std::vector<WireId> livelock_prev; // the overused wire set being compared across iters
     int _overuse_seen = 0;        // SPIKE_DUMP_OVERUSE: iters with overuse seen, to dump once
 
     // Use 'udata' for fast net lookups and indexing
@@ -1315,13 +1316,27 @@ struct Router2
         // re-route freedom, no penalty steering). Gated on the fuzzy/livelock env so the
         // unset-knob flow stays bit-identical (the off-switch regression gate).
         if (livelock_break && overused_wires > 0 && overused_wires <= 8) {
-            livelock_stuck++;
+            // Stagnation detection: the SAME overused wire set persisting is the
+            // livelock signature — fire at 15 identical iterations instead of a
+            // blanket 60 (each farm-scale iteration costs seconds; the old threshold
+            // added ~4 min of ping-pong per round before breaking).
+            std::vector<WireId> cur;
+            for (auto &wire : flat_wires)
+                if (int(wire.bound_nets.size()) > 1)
+                    cur.push_back(wire.w);
+            if (cur == livelock_prev)
+                livelock_stuck++;
+            else {
+                livelock_stuck = 1;
+                livelock_prev = std::move(cur);
+            }
         } else {
             livelock_stuck = 0;
+            livelock_prev.clear();
             if (overused_wires == 0)
                 livelock_rounds = 0;
         }
-        if (livelock_stuck >= 60) {
+        if (livelock_stuck >= 15) {
             livelock_stuck = 0;
             livelock_rounds++;
             for (auto &wire : flat_wires) {

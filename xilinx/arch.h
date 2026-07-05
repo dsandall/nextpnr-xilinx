@@ -1270,20 +1270,38 @@ struct Arch : BaseCtx
         return s;
     }
 
-    // fuzzy boundaries (shortshift docs/126): sever a bound net's branches inside ONE
-    // site (wire-name prefix "SITEWIRE/<site>/") plus everything routed downstream of
-    // them. Used by the fuzzy_rebind pre-route hook on the frozen CONST nets: a WEAK-
-    // hinted cell that MOVED leaves the const net's old site ties (CEUSEDMUX, A6-VCC)
-    // bound at >STRONG strength — non-negotiable, so a fresh arc into that site mux
-    // route-fails. The freed INT spur stays bound (STRONG, yields normally).
-    // Returns the number of wires unbound.
-    int severNetSiteBranches(NetInfo *net, std::string site)
+    // fuzzy boundaries (shortshift docs/126): sever a bound net's branches inside the
+    // given SITES (';'-separated site names; wire-name prefix "SITEWIRE/<site>/") plus
+    // everything routed downstream of them. Used by the fuzzy_rebind pre-route hook on
+    // the frozen CONST nets: a WEAK-hinted cell that MOVED leaves the const net's old
+    // site ties (CEUSEDMUX, A6-VCC) bound at >STRONG strength — non-negotiable, so a
+    // fresh arc into that site mux route-fails. The freed INT spur stays bound (STRONG,
+    // yields normally; pruneNetDeadBranches drops the dead stubs).
+    // ONE wire scan for all sites (per-site scans were O(sites × wires × strlen): 388
+    // full passes of a ~100k-wire const net at hops=8). Returns the wires unbound.
+    int severNetSiteBranches(NetInfo *net, std::string sites)
     {
-        const std::string pfx = "SITEWIRE/" + site + "/";
+        std::set<std::string> siteset;
+        size_t pos = 0;
+        while (pos < sites.size()) {
+            size_t semi = sites.find(';', pos);
+            if (semi == std::string::npos)
+                semi = sites.size();
+            if (semi > pos)
+                siteset.insert(sites.substr(pos, semi - pos));
+            pos = semi + 1;
+        }
+        if (siteset.empty())
+            return 0;
         std::set<WireId> dead;
         for (auto &it : net->wires) {
             const std::string wn = getWireName(it.first).str(this);
-            if (wn.compare(0, pfx.size(), pfx) == 0)
+            if (wn.compare(0, 9, "SITEWIRE/") != 0)
+                continue;
+            size_t slash = wn.find('/', 9);
+            if (slash == std::string::npos)
+                continue;
+            if (siteset.count(wn.substr(9, slash - 9)))
                 dead.insert(it.first);
         }
         if (dead.empty())
@@ -1330,27 +1348,36 @@ struct Arch : BaseCtx
             if (sw != WireId())
                 sinks.insert(sw);
         }
+        // Refcount + worklist: O(wires + pruned) instead of the fixpoint rescans
+        // (O(stub-depth × wires); the h8 case prunes 5k+ wires of a ~100k-wire net).
+        std::map<WireId, int> child_cnt; // wire -> # bound pips sourcing FROM it
+        std::map<WireId, WireId> parent; // wire -> its driving pip's src wire
+        for (auto &it : net->wires) {
+            if (it.second.pip == PipId())
+                continue;
+            WireId src = getPipSrcWire(it.second.pip);
+            child_cnt[src]++;
+            parent[it.first] = src;
+        }
+        std::vector<WireId> work;
+        for (auto &it : net->wires) {
+            if (it.second.pip == PipId())
+                continue; // root / site-source wire
+            if (child_cnt.count(it.first) == 0 && !sinks.count(it.first))
+                work.push_back(it.first);
+        }
         int removed = 0;
-        bool grew = true;
-        while (grew) {
-            grew = false;
-            std::set<WireId> has_child;
-            for (auto &it : net->wires)
-                if (it.second.pip != PipId())
-                    has_child.insert(getPipSrcWire(it.second.pip));
-            std::vector<WireId> dead;
-            for (auto &it : net->wires) {
-                if (it.second.pip == PipId())
-                    continue; // root / site-source wire
-                if (has_child.count(it.first) || sinks.count(it.first))
-                    continue;
-                dead.push_back(it.first);
-            }
-            for (WireId w : dead) {
-                unbindWire(w);
-                removed++;
-                grew = true;
-            }
+        while (!work.empty()) {
+            WireId w = work.back();
+            work.pop_back();
+            auto pit = parent.find(w);
+            unbindWire(w);
+            removed++;
+            if (pit == parent.end())
+                continue;
+            WireId src = pit->second;
+            if (--child_cnt[src] == 0 && !sinks.count(src) && parent.count(src))
+                work.push_back(src);
         }
         return removed;
     }
