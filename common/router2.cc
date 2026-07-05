@@ -140,8 +140,13 @@ struct Router2
     float edge_penalty = 1.0f;    // docs/125: penalty for reused arcs within ripup_depth of the edge
     bool livelock_break = false;  // docs/126: net-level yield escalation for stuck tiny overuse
     int livelock_stuck = 0;       // consecutive iters with an UNCHANGED tiny overused set
+    int livelock_band = 0;        // consecutive iters with ANY tiny overuse (fallback trigger)
     int livelock_rounds = 0;      // firings since overuse last hit 0 (round 2+ rips fresh too)
     std::vector<WireId> livelock_prev; // the overused wire set being compared across iters
+    int livelock_maxw = [] {           // gate: only watch for stagnation below this overuse
+        const char *p = getenv("SPIKE_REUSE_LIVELOCK_MAXW");
+        return p ? atoi(p) : 64;       // aes_gen cascaded into a STAGNANT 28-wire set (>8)
+    }();
     int _overuse_seen = 0;        // SPIKE_DUMP_OVERUSE: iters with overuse seen, to dump once
 
     // Use 'udata' for fast net lookups and indexing
@@ -1382,7 +1387,7 @@ struct Router2
         // REUSED nets entirely and clear their reuse status (net-level yield: full
         // re-route freedom, no penalty steering). Gated on the fuzzy/livelock env so the
         // unset-knob flow stays bit-identical (the off-switch regression gate).
-        if (livelock_break && overused_wires > 0 && overused_wires <= 8) {
+        if (livelock_break && overused_wires > 0 && overused_wires <= livelock_maxw) {
             // Stagnation detection: the SAME overused wire set persisting is the
             // livelock signature — fire at 15 identical iterations instead of a
             // blanket 60 (each farm-scale iteration costs seconds; the old threshold
@@ -1397,14 +1402,20 @@ struct Router2
                 livelock_stuck = 1;
                 livelock_prev = std::move(cur);
             }
+            livelock_band++; // in the tiny-overuse band, set identical or not
         } else {
             livelock_stuck = 0;
+            livelock_band = 0;
             livelock_prev.clear();
             if (overused_wires == 0)
                 livelock_rounds = 0;
         }
-        if (livelock_stuck >= 15) {
+        // Fire on a STAGNANT identical set (fast, 15 iters) or on ANY persistent
+        // tiny-overuse band (40 iters): aes_gen's post-demand-yield cascade churns
+        // between overlapping 28-wire sets, never identical, going nowhere.
+        if (livelock_stuck >= 15 || livelock_band >= 40) {
             livelock_stuck = 0;
+            livelock_band = 0;
             livelock_rounds++;
             for (auto &wire : flat_wires) {
                 if (int(wire.bound_nets.size()) <= 1)
