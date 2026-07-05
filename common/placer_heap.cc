@@ -252,10 +252,6 @@ class HeAPPlacer
                          int(spread_hpwl), int(legal_hpwl),
                          std::chrono::duration<double>(run_stopt - run_startt).count());
             }
-            // fuzzy static friction (docs/126): re-evaluate after each settled round —
-            // pulls change as the checker converges; newly broken cells join the next
-            // round's solve via setup_solve_cells (rebuilt from place_cells).
-            fuzzy_breakaway_check();
 
             if (cfg.timing_driven)
                 get_criticalities(ctx, &net_crit);
@@ -271,6 +267,13 @@ class HeAPPlacer
             } else {
                 ++stalled;
             }
+            // fuzzy static friction (docs/126): re-evaluate AFTER the solution snapshot —
+            // a just-broken cell is momentarily unbound, and snapshotting it as BelId()
+            // made the final restore bind nothing (assert). This ordering means a cell
+            // that breaks in the very last round simply restores at its cached home
+            // (friction held it); earlier breakers get solved+legalised next round and
+            // enter later snapshots at their new bel.
+            fuzzy_breakaway_check();
             for (auto &cl : cell_locs) {
                 cl.second.legal_x = cl.second.x;
                 cl.second.legal_y = cl.second.y;
