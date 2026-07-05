@@ -67,6 +67,8 @@ struct Router2
         float max_crit = 0;
         int fail_count = 0;
         bool is_reuse = false;   // split-flow option (c): yields to fresh nets (docs/47)
+        int reuse_group = -1;    // fuzzy boundaries (shortshift docs/125): REUSE_GEN attr,
+                                 // interned -> index into reuse_group_rect
     };
 
     struct WireScore
@@ -119,9 +121,19 @@ struct Router2
         // docs/96: REUSE_NET yield penalty, tunable so cached routing seeds without forcing.
         if (const char *p = getenv("SPIKE_REUSE_PENALTY"))
             reuse_penalty = float(atof(p));
+        // fuzzy boundaries (shortshift docs/125): within `ripup_depth` tiles of the gen's
+        // own frozen-footprint bbox edge, reused arcs pay `edge_penalty` (default 1.0 =
+        // plain PathFinder negotiation) instead of reuse_penalty. Unset/negative = OFF,
+        // behavior bit-identical to the uniform-penalty router (the regression gate).
+        if (const char *p = getenv("SPIKE_REUSE_RIPUP_DEPTH"))
+            ripup_depth = atoi(p);
+        if (const char *p = getenv("SPIKE_REUSE_EDGE_PENALTY"))
+            edge_penalty = float(atof(p));
     }
 
     float reuse_penalty = 3.0f;   // 8x deadlocked dense-CPU reuse; 3x = seed-not-force default
+    int ripup_depth = -1;         // docs/125: tiles from gen bbox edge that stay squishy; <0 = off
+    float edge_penalty = 1.0f;    // docs/125: penalty for reused arcs within ripup_depth of the edge
     int _overuse_seen = 0;        // SPIKE_DUMP_OVERUSE: iters with overuse seen, to dump once
 
     // Use 'udata' for fast net lookups and indexing
@@ -147,6 +159,19 @@ struct Router2
             nets_by_udata.at(i) = ni;
             nets.at(i).arcs.resize(ni->users.size());
             nets.at(i).is_reuse = ni->attrs.count(ctx->id("REUSE_NET")) != 0;
+            // fuzzy boundaries (docs/125): intern the net's gen membership (REUSE_GEN,
+            // stamped by freeze_gen.py on every net that kept ROUTING_LOCS) to a group id.
+            // Only when the depth gate is armed — OFF mode must stay bit-identical.
+            if (ripup_depth >= 0) {
+                auto rg = ni->attrs.find(ctx->id("REUSE_GEN"));
+                if (rg != ni->attrs.end()) {
+                    const std::string g = rg->second.as_string();
+                    auto it = reuse_group_ids.find(g);
+                    if (it == reuse_group_ids.end())
+                        it = reuse_group_ids.emplace(g, int(reuse_group_ids.size())).first;
+                    nets.at(i).reuse_group = it->second;
+                }
+            }
 
             // Start net bounding box at overall min/max
             nets.at(i).bb.x0 = std::numeric_limits<int>::max();
@@ -215,6 +240,70 @@ struct Router2
     std::vector<PerWireData> flat_wires;
 
     PerWireData &wire_data(WireId w) { return flat_wires[wire_to_idx.at(w)]; }
+
+    // fuzzy boundaries (docs/125): REUSE_GEN attr string -> group id -> the gen's own
+    // PLACEMENT bbox (folded from its frozen cells' BEL locations). Built once before
+    // routing threads start; read-only in the hot loop.
+    std::map<std::string, int> reuse_group_ids;
+    std::vector<ArcBounds> reuse_group_rect;
+
+    void setup_reuse_groups()
+    {
+        if (ripup_depth < 0 || reuse_group_ids.empty())
+            return;
+        reuse_group_rect.resize(reuse_group_ids.size());
+        for (auto &r : reuse_group_rect) {
+            r.x0 = std::numeric_limits<int>::max();
+            r.y0 = std::numeric_limits<int>::max();
+            r.x1 = std::numeric_limits<int>::min();
+            r.y1 = std::numeric_limits<int>::min();
+        }
+        // Derive each gen's region from the PLACEMENT of its frozen cells: fold the BEL
+        // locations of the group nets' driver/user cells (X_FROZEN-filtered) — "the gen's
+        // own placement bbox" per docs/125. Folding bound WIRES was tried first and
+        // inflated the bbox to near-die-size (far-straying const/INT arcs -> two_gen genA
+        // came out (2,0)-(104,149)), wrongly classifying the real region edge as deep
+        // interior. Stray wires OUTSIDE the placement bbox get depth < 0 -> squishiest,
+        // the desired direction (docs/93 const-freeze history).
+        const IdString x_frozen = ctx->id("X_FROZEN");
+        for (size_t i = 0; i < nets_by_udata.size(); i++) {
+            int g = nets.at(i).reuse_group;
+            if (g < 0)
+                continue;
+            NetInfo *ni = nets_by_udata.at(i);
+            // Const nets pollute the fold two ways: their PSEUDO GND/VCC driver sits at a
+            // die-corner BEL, and combine can MERGE the gens' const nets so one net's users
+            // span every gen (two_gen genA folded to (0,43)-(104,149) before this skip).
+            // They still RECEIVE depth-gating via their group's bbox — outside-bbox const
+            // arcs land at depth < 0, the squishiest class, exactly as docs/125 intends.
+            const std::string nname = ni->name.str(ctx);
+            if (nname.find("$PACKER_GND_NET") != std::string::npos ||
+                nname.find("$PACKER_VCC_NET") != std::string::npos)
+                continue;
+            auto fold = [&](const CellInfo *cell) {
+                if (cell == nullptr || cell->bel == BelId() || !cell->attrs.count(x_frozen))
+                    return;
+                Loc l = ctx->getBelLocation(cell->bel);
+                auto &r = reuse_group_rect.at(g);
+                r.x0 = std::min(r.x0, l.x);
+                r.y0 = std::min(r.y0, l.y);
+                r.x1 = std::max(r.x1, l.x);
+                r.y1 = std::max(r.y1, l.y);
+            };
+            fold(ni->driver.cell);
+            for (auto &usr : ni->users)
+                fold(usr.cell);
+        }
+        for (auto &gi : reuse_group_ids) {
+            const auto &r = reuse_group_rect.at(gi.second);
+            if (r.x0 > r.x1)
+                log_info("fuzzy: reuse group '%s' has no frozen placed cells; depth gate inert for it\n",
+                         gi.first.c_str());
+            else
+                log_info("fuzzy: reuse group '%s' bbox (%d,%d)-(%d,%d), ripup_depth=%d edge_penalty=%.2f\n",
+                         gi.first.c_str(), r.x0, r.y0, r.x1, r.y1, ripup_depth, edge_penalty);
+        }
+    }
 
     void setup_wires()
     {
@@ -382,8 +471,21 @@ struct Router2
         // disables the yield entirely (pure PathFinder negotiation on the seeded routing).
         if (nd.is_reuse) {
             size_t others = wd.bound_nets.size() - (wd.bound_nets.count(net->udata) ? 1 : 0);
-            if (others > 0)
-                present_cost *= reuse_penalty;
+            if (others > 0) {
+                float pen = reuse_penalty;
+                // fuzzy boundaries (docs/125): within ripup_depth tiles of this gen's own
+                // bbox edge the reused arc negotiates at edge_penalty (default 1.0, plain
+                // PathFinder). Wires OUTSIDE the bbox (depth < 0, e.g. far-flung const
+                // arcs) are the squishiest of all. Deeper interior keeps reuse_penalty.
+                if (ripup_depth >= 0 && nd.reuse_group >= 0) {
+                    const ArcBounds &r = reuse_group_rect[nd.reuse_group];
+                    int depth = std::min(std::min(wd.x - r.x0, r.x1 - wd.x),
+                                         std::min(wd.y - r.y0, r.y1 - wd.y));
+                    if (depth <= ripup_depth)
+                        pen = edge_penalty;
+                }
+                present_cost *= pen;
+            }
         }
         float bias_cost = 0;
         int source_uses = 0;
@@ -1527,6 +1629,7 @@ struct Router2
         auto rstart = std::chrono::high_resolution_clock::now();
         setup_nets();
         setup_wires();
+        setup_reuse_groups(); // fuzzy boundaries (docs/125); no-op unless SPIKE_REUSE_RIPUP_DEPTH set
         find_all_reserved_wires();
         partition_nets();
         curr_cong_weight = cfg.init_curr_cong_weight;
