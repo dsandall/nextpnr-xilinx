@@ -642,7 +642,20 @@ void Arch::fixupPlacement()
     // ties on 5LUT bels are stripped gen-side (freeze_gen §5c). Skip them here so post-
     // place legalisation (LUT-input re-permutation, const re-tie, MUXF/FF/carry fixup)
     // doesn't disconnect/reconnect frozen ports (which asserts and shatters reuse).
-    auto frz = [&](const CellInfo *c) { return c != nullptr && c->attrs.count(id("X_FROZEN")) != 0; };
+    auto frz = [&](const CellInfo *c) {
+        if (c == nullptr || c->attrs.count(id("X_FROZEN")) == 0)
+            return false;
+        // fuzzy boundaries (shortshift docs/126): a frozen cell placement-hinted at WEAK
+        // strength may have MOVED during the bind's placement. Its gen-era site config
+        // (LUT pin permutation, const ties) is stale at the new location and its cached
+        // routing is forfeited (fuzzy_rebind skips it), so it needs NORMAL legalisation
+        // here -- only frozen cells still at their cached BEL keep the skip.
+        auto it = c->attrs.find(id("NEXTPNR_BEL"));
+        if (it != c->attrs.end() && c->bel != BelId() &&
+            getBelName(c->bel).str(getCtx()) != it->second.as_string())
+            return false;
+        return true;
+    };
     for (auto &ts : tileStatus) {
         if (ts.lts == nullptr)
             continue;

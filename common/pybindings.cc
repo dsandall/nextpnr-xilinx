@@ -207,6 +207,10 @@ BOOST_PYTHON_MODULE(MODULE_NAME)
             ni_cls, "users");
     readonly_wrapper<NetInfo &, decltype(&NetInfo::wires), &NetInfo::wires, wrap_context<WireMap &>>::def_wrap(ni_cls,
                                                                                                                "wires");
+    // fuzzy boundaries (shortshift docs/126): the fuzzy_rebind pre-route hook reads net
+    // attrs (ROUTING_LOCS_DEFER) to decide which deferred nets to rebind after placement.
+    readonly_wrapper<NetInfo &, decltype(&NetInfo::attrs), &NetInfo::attrs, wrap_context<AttrMap &>>::def_wrap(
+            ni_cls, "attrs");
 
     auto pr_cls = class_<ContextualWrapper<PortRef &>>("PortRef", no_init);
     readonly_wrapper<PortRef &, decltype(&PortRef::cell), &PortRef::cell, deref_and_wrap<CellInfo>>::def_wrap(pr_cls,

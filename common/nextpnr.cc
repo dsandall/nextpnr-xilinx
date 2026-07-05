@@ -624,6 +624,112 @@ void BaseCtx::archInfoToAttributes()
     }
 }
 
+#ifdef ARCH_XILINX
+int BaseCtx::bindRoutingLocsChecked(NetInfo *ni, const std::string &s)
+{
+    // Each record is "wt,wi,pt,pi,strength;"; (pt,pi) < 0 marks a root/site-source wire.
+    struct LocEntry
+    {
+        int wt, wi, pt, pi, st;
+    };
+    std::vector<LocEntry> entries;
+    size_t pos = 0;
+    while (pos < s.size()) {
+        LocEntry e{};
+        if (std::sscanf(s.c_str() + pos, "%d,%d,%d,%d,%d", &e.wt, &e.wi, &e.pt, &e.pi, &e.st) != 5)
+            break;
+        entries.push_back(e);
+        size_t semi = s.find(';', pos);
+        if (semi == std::string::npos)
+            break;
+        pos = semi + 1;
+    }
+    // Precheck before binding anything: independently-P&R'd frozen gens can land
+    // on the same canonical node (xc7 wires are multi-tile nodes -- long LV/LH
+    // wires cross region boundaries), so two gens' dumped arcs may claim one dst
+    // wire even with zero raw {tile,index} overlap (shortshift docs/123). bindPip
+    // hard-asserts on that. Sever ONLY the colliding wire and its downstream
+    // subtree (a kept pip whose src was dropped would orphan its branch) and bind
+    // the rest: the router completes just the missing arcs. Dropping the WHOLE
+    // net was tried first and route-fails -- a fresh path through a fully-frozen
+    // CPU interior may not exist, while the severed branch is small (docs/124).
+    // Each record's {wt,wi} is its own canonical dst wire (net->wires keys).
+    std::set<std::pair<int, int>> dead;
+    const NetInfo *owner = nullptr;
+    bool root_dead = false;
+    for (const auto &e : entries) {
+        WireId w;
+        w.tile = e.wt;
+        w.index = e.wi;
+        NetInfo *wo = getCtx()->getBoundWireNet(w);
+        NetInfo *po = nullptr;
+        if (e.pt >= 0) {
+            PipId p;
+            p.tile = e.pt;
+            p.index = e.pi;
+            po = getCtx()->getBoundPipNet(p);
+        }
+        if ((wo && wo != ni) || (po && po != ni)) {
+            dead.insert({e.wt, e.wi});
+            if (!owner)
+                owner = (wo && wo != ni) ? wo : po;
+            if (e.pt < 0)
+                root_dead = true; // source wire itself is taken -- nothing bindable
+        }
+    }
+    // Propagate death downstream: a record whose pip DRIVES FROM a dead wire is
+    // disconnected from the kept tree. Fixpoint loop (records are unordered).
+    if (!dead.empty() && !root_dead) {
+        bool grew = true;
+        while (grew) {
+            grew = false;
+            for (const auto &e : entries) {
+                if (e.pt < 0 || dead.count({e.wt, e.wi}))
+                    continue;
+                PipId p;
+                p.tile = e.pt;
+                p.index = e.pi;
+                WireId src = getCtx()->getPipSrcWire(p);
+                if (dead.count({src.tile, src.index})) {
+                    dead.insert({e.wt, e.wi});
+                    grew = true;
+                }
+            }
+        }
+    }
+    if (root_dead) {
+        reuse_conflict_nets++;
+        if (reuse_conflict_nets <= 10)
+            log_warning("reuse locs conflict: net '%s' source wire is owned by net '%s'; "
+                        "dropping ALL of its reused routing (will route fresh)\n",
+                        nameOf(ni), nameOf(owner));
+        return 0; // no REUSE_NET mark -- it's a plain fresh net now
+    }
+    if (!dead.empty()) {
+        reuse_conflict_nets++;
+        if (reuse_conflict_nets <= 10)
+            log_warning("reuse locs conflict: net '%s' overlaps net '%s'; severing %d of %d "
+                        "arcs (colliding branch reroutes; rest of the tree is kept)\n",
+                        nameOf(ni), nameOf(owner), int(dead.size()), int(entries.size()));
+    }
+    // Mark REUSE so router2 makes these arcs YIELD under contention (docs/47):
+    // independently-P&R'd frozen gens can route onto the same shared global/long
+    // wires, so a colliding frozen arc must reroute AROUND rather than overuse.
+    // Harmless for a contention-free faithful round-trip (the router never rips).
+    ni->attrs[id("REUSE_NET")] = Property(1);
+    for (const auto &e : entries) {
+        if (dead.count({e.wt, e.wi}))
+            continue;
+        PlaceStrength strength = (PlaceStrength)e.st;
+        if (e.pt < 0)
+            getCtx()->bindWireByLoc(e.wt, e.wi, ni, strength); // root / site-source wire
+        else
+            getCtx()->bindPipByLoc(e.pt, e.pi, ni, strength); // binds the pip's dst wire too
+    }
+    return 1;
+}
+#endif
+
 void BaseCtx::attributesToArchInfo()
 {
     for (auto &cell : cells) {
@@ -681,118 +787,19 @@ void BaseCtx::attributesToArchInfo()
             }
         }
     }
-#ifdef ARCH_XILINX
-    int reuse_conflict_nets = 0;
-#endif
     for (auto &net : getCtx()->nets) {
         auto ni = net.second.get();
 #ifdef ARCH_XILINX
         // Prefer the faithful loc form (ROUTING_LOCS, see archInfoToAttributes): bind by
         // globally-stable {tile,index} so a written design reloads EXACTLY -- the
-        // name-based ROUTING path below aborts on this fork (getPipByName, docs/38). Each
-        // record is "wt,wi,pt,pi,strength;"; (pt,pi) < 0 marks a root/site-source wire.
+        // name-based ROUTING path below aborts on this fork (getPipByName, docs/38).
+        // Nets carrying ROUTING_LOCS_DEFER instead (fuzzy boundaries, docs/126) are NOT
+        // bound here: the fuzzy_rebind pre-route hook binds them after placement, only
+        // if their placement-hinted cells stayed put.
         auto vloc = ni->attrs.find(id("ROUTING_LOCS"));
         if (vloc != ni->attrs.end()) {
-            const std::string s = vloc->second.as_string();
-            struct LocEntry
-            {
-                int wt, wi, pt, pi, st;
-            };
-            std::vector<LocEntry> entries;
-            size_t pos = 0;
-            while (pos < s.size()) {
-                LocEntry e{};
-                if (std::sscanf(s.c_str() + pos, "%d,%d,%d,%d,%d", &e.wt, &e.wi, &e.pt, &e.pi, &e.st) != 5)
-                    break;
-                entries.push_back(e);
-                size_t semi = s.find(';', pos);
-                if (semi == std::string::npos)
-                    break;
-                pos = semi + 1;
-            }
-            // Precheck before binding anything: independently-P&R'd frozen gens can land
-            // on the same canonical node (xc7 wires are multi-tile nodes -- long LV/LH
-            // wires cross region boundaries), so two gens' dumped arcs may claim one dst
-            // wire even with zero raw {tile,index} overlap (shortshift docs/123). bindPip
-            // hard-asserts on that. Sever ONLY the colliding wire and its downstream
-            // subtree (a kept pip whose src was dropped would orphan its branch) and bind
-            // the rest: the router completes just the missing arcs. Dropping the WHOLE
-            // net was tried first and route-fails -- a fresh path through a fully-frozen
-            // CPU interior may not exist, while the severed branch is small (docs/124).
-            // Each record's {wt,wi} is its own canonical dst wire (net->wires keys).
-            std::set<std::pair<int, int>> dead;
-            const NetInfo *owner = nullptr;
-            bool root_dead = false;
-            for (const auto &e : entries) {
-                WireId w;
-                w.tile = e.wt;
-                w.index = e.wi;
-                NetInfo *wo = getCtx()->getBoundWireNet(w);
-                NetInfo *po = nullptr;
-                if (e.pt >= 0) {
-                    PipId p;
-                    p.tile = e.pt;
-                    p.index = e.pi;
-                    po = getCtx()->getBoundPipNet(p);
-                }
-                if ((wo && wo != ni) || (po && po != ni)) {
-                    dead.insert({e.wt, e.wi});
-                    if (!owner)
-                        owner = (wo && wo != ni) ? wo : po;
-                    if (e.pt < 0)
-                        root_dead = true; // source wire itself is taken -- nothing bindable
-                }
-            }
-            // Propagate death downstream: a record whose pip DRIVES FROM a dead wire is
-            // disconnected from the kept tree. Fixpoint loop (records are unordered).
-            if (!dead.empty() && !root_dead) {
-                bool grew = true;
-                while (grew) {
-                    grew = false;
-                    for (const auto &e : entries) {
-                        if (e.pt < 0 || dead.count({e.wt, e.wi}))
-                            continue;
-                        PipId p;
-                        p.tile = e.pt;
-                        p.index = e.pi;
-                        WireId src = getCtx()->getPipSrcWire(p);
-                        if (dead.count({src.tile, src.index})) {
-                            dead.insert({e.wt, e.wi});
-                            grew = true;
-                        }
-                    }
-                }
-            }
-            if (root_dead) {
-                reuse_conflict_nets++;
-                if (reuse_conflict_nets <= 10)
-                    log_warning("reuse locs conflict: net '%s' source wire is owned by net '%s'; "
-                                "dropping ALL of its reused routing (will route fresh)\n",
-                                nameOf(ni), nameOf(owner));
-                continue; // no REUSE_NET mark -- it's a plain fresh net now
-            }
-            if (!dead.empty()) {
-                reuse_conflict_nets++;
-                if (reuse_conflict_nets <= 10)
-                    log_warning("reuse locs conflict: net '%s' overlaps net '%s'; severing %d of %d "
-                                "arcs (colliding branch reroutes; rest of the tree is kept)\n",
-                                nameOf(ni), nameOf(owner), int(dead.size()), int(entries.size()));
-            }
-            // Mark REUSE so router2 makes these arcs YIELD under contention (docs/47):
-            // independently-P&R'd frozen gens can route onto the same shared global/long
-            // wires, so a colliding frozen arc must reroute AROUND rather than overuse.
-            // Harmless for a contention-free faithful round-trip (the router never rips).
-            ni->attrs[id("REUSE_NET")] = Property(1);
-            for (const auto &e : entries) {
-                if (dead.count({e.wt, e.wi}))
-                    continue;
-                PlaceStrength strength = (PlaceStrength)e.st;
-                if (e.pt < 0)
-                    getCtx()->bindWireByLoc(e.wt, e.wi, ni, strength); // root / site-source wire
-                else
-                    getCtx()->bindPipByLoc(e.pt, e.pi, ni, strength); // binds the pip's dst wire too
-            }
-            continue; // bound from locs; skip the (broken-on-xilinx) name path below
+            bindRoutingLocsChecked(ni, vloc->second.as_string());
+            continue; // bound from locs (or root-dead -> fresh); skip the name path below
         }
 #endif
         auto val = ni->attrs.find(id("ROUTING"));

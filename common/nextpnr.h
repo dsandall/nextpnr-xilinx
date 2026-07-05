@@ -841,6 +841,17 @@ struct BaseCtx
 
     void archInfoToAttributes();
     void attributesToArchInfo();
+
+#ifdef ARCH_XILINX
+    // Sever-checked ROUTING_LOCS reload (docs/123/124): precheck every record against
+    // already-bound wires/pips, sever only colliding branches (+ their downstream), stamp
+    // REUSE_NET, bind the rest. Returns 1 if a tree was bound, 0 if the root wire was
+    // taken (net left fully fresh). Factored out of attributesToArchInfo so the fuzzy-
+    // boundaries pre-route hook (shortshift docs/126) can conditionally rebind DEFERRED
+    // nets after placement settles. `locs` is the 5-field "wt,wi,pt,pi,strength;" form.
+    int bindRoutingLocsChecked(NetInfo *ni, const std::string &locs);
+    int reuse_conflict_nets = 0; // shared warn-limit counter for the above
+#endif
 };
 
 NEXTPNR_NAMESPACE_END

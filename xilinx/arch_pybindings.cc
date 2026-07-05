@@ -77,6 +77,11 @@ void arch_wrap_python()
     fn_wrapper_3a_v<Context, decltype(&Context::bindNetRoutingLocs), &Context::bindNetRoutingLocs,
                     addr_and_unwrap<NetInfo>, pass_through<std::string>, pass_through<PlaceStrength>>::def_wrap(
             ctx_cls, "bindNetRoutingLocs");
+    // fuzzy boundaries (shortshift docs/126): sever-checked 5-field locs reload for the
+    // fuzzy_rebind pre-route hook (same collision severing as the load-time path).
+    fn_wrapper_2a<Context, decltype(&Context::bindRoutingLocsChecked), &Context::bindRoutingLocsChecked,
+                  pass_through<int>, addr_and_unwrap<NetInfo>, pass_through<std::string>>::def_wrap(
+            ctx_cls, "bindRoutingLocsChecked");
 
     WRAP_RANGE(Bel, conv_to_str<BelId>);
     WRAP_RANGE(Wire, conv_to_str<WireId>);

@@ -35,7 +35,14 @@ NEXTPNR_NAMESPACE_BEGIN
 
 using namespace boost::python;
 
-inline void KeyError() { PyErr_SetString(PyExc_KeyError, "Key not found"); }
+// Must THROW (not just set the indicator): callers fall through to std::terminate()
+// otherwise -- a missing-key __getitem__ from a python hook aborted the whole process
+// ("terminate called without an active exception"; fuzzy_rebind.py, shortshift docs/126).
+inline void KeyError()
+{
+    PyErr_SetString(PyExc_KeyError, "Key not found");
+    boost::python::throw_error_already_set();
+}
 
 /*
 A wrapper for a Pythonised nextpnr Iterator. The actual class wrapped is a
