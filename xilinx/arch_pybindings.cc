@@ -87,6 +87,10 @@ void arch_wrap_python()
     fn_wrapper_2a<Context, decltype(&Context::severNetSiteBranches), &Context::severNetSiteBranches,
                   pass_through<int>, addr_and_unwrap<NetInfo>, pass_through<std::string>>::def_wrap(
             ctx_cls, "severNetSiteBranches");
+    // fuzzy boundaries (docs/126): after site severing, drop the dead upstream INT
+    // stubs whose final pip still hard-owns a site entrance.
+    fn_wrapper_1a<Context, decltype(&Context::pruneNetDeadBranches), &Context::pruneNetDeadBranches,
+                  pass_through<int>, addr_and_unwrap<NetInfo>>::def_wrap(ctx_cls, "pruneNetDeadBranches");
 
     WRAP_RANGE(Bel, conv_to_str<BelId>);
     WRAP_RANGE(Wire, conv_to_str<WireId>);

@@ -1305,6 +1305,56 @@ struct Arch : BaseCtx
         return int(dead.size());
     }
 
+    // fuzzy boundaries (shortshift docs/126): after severNetSiteBranches removes a moved
+    // cell's old-site const ties, the upstream INT spur that fed them stays bound as a
+    // DEAD STUB — and a stub's final pip (e.g. INT FAN6 -> CLBLM_L_CE -> site CE) still
+    // OWNS the slice's only CE entrance (a pip bound to another net is a hard A* reject,
+    // not negotiable contention), so the newcomer's CE arc is unroutable. Iteratively
+    // unbind leaf wires that neither source a bound pip nor serve any user's CURRENT
+    // sink pin. Root/site-source wires (no driving pip) are kept. Returns wires unbound.
+    int pruneNetDeadBranches(NetInfo *net)
+    {
+        // legit leaves = each user's sink pin wire per the CURRENT placement
+        // (replicates Context::getNetinfoSinkWire via getBelPinWire; Context is
+        // incomplete here — same pattern as getNetRoutingLocs above)
+        std::set<WireId> sinks;
+        for (auto &usr : net->users) {
+            BelId dst_bel = usr.cell->bel;
+            if (dst_bel == BelId())
+                continue;
+            IdString user_port = usr.port;
+            auto pit = usr.cell->pins.find(user_port);
+            if (pit != usr.cell->pins.end())
+                user_port = pit->second;
+            WireId sw = getBelPinWire(dst_bel, user_port);
+            if (sw != WireId())
+                sinks.insert(sw);
+        }
+        int removed = 0;
+        bool grew = true;
+        while (grew) {
+            grew = false;
+            std::set<WireId> has_child;
+            for (auto &it : net->wires)
+                if (it.second.pip != PipId())
+                    has_child.insert(getPipSrcWire(it.second.pip));
+            std::vector<WireId> dead;
+            for (auto &it : net->wires) {
+                if (it.second.pip == PipId())
+                    continue; // root / site-source wire
+                if (has_child.count(it.first) || sinks.count(it.first))
+                    continue;
+                dead.push_back(it.first);
+            }
+            for (WireId w : dead) {
+                unbindWire(w);
+                removed++;
+                grew = true;
+            }
+        }
+        return removed;
+    }
+
     void bindNetRoutingLocs(NetInfo *net, std::string s, PlaceStrength strength)
     {
         // Mark this as a REUSED net so router2 makes it YIELD to fresh nets under

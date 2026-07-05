@@ -1180,6 +1180,39 @@ struct Router2
                             log_info("  [fail-diag] uphill pip %s avail=%d bound=%s\n", ctx->nameOfPip(uh),
                                      int(ctx->checkPipAvail(uh)), own ? ctx->nameOf(own) : "-");
                         }
+                        // Walk the sink's uphill cone a few levels: the wall is often
+                        // one hop above the sink (site input pip / tile CTRL wire) —
+                        // print avail + owner + reservation for each candidate wire.
+                        {
+                            std::set<WireId> seen{dw};
+                            std::vector<WireId> frontier{dw};
+                            for (int depth = 1; depth <= 3 && !frontier.empty(); depth++) {
+                                std::vector<WireId> next;
+                                for (WireId fw : frontier) {
+                                    for (auto uh : ctx->getPipsUphill(fw)) {
+                                        WireId sww = ctx->getPipSrcWire(uh);
+                                        if (seen.count(sww))
+                                            continue;
+                                        seen.insert(sww);
+                                        auto &swd = wire_data(sww);
+                                        std::string owners;
+                                        for (auto bn : swd.bound_nets)
+                                            owners += std::string(owners.empty() ? "" : ",") +
+                                                      ctx->nameOf(nets_by_udata.at(bn.first));
+                                        log_info("  [fail-diag] cone d%d wire %s (via %s pipavail=%d "
+                                                 "hard=%d) unavail=%d resv=%s bound=[%s]\n",
+                                                 depth, ctx->nameOfWire(sww), ctx->nameOfPip(uh),
+                                                 int(ctx->checkPipAvail(uh)), int(ctx->usp_pip_hard_unavail(uh)),
+                                                 int(swd.unavailable),
+                                                 swd.reserved_net != -1 ? ctx->nameOf(nets_by_udata.at(swd.reserved_net))
+                                                                        : "-",
+                                                 owners.c_str());
+                                        next.push_back(sww);
+                                    }
+                                }
+                                frontier = next;
+                            }
+                        }
                         // Source side: can the arc even leave the driver pin?
                         WireId sw = ctx->getNetinfoSourceWire(net);
                         log_info("  [fail-diag] net has %d bound wires; src bound to net: %d\n",
