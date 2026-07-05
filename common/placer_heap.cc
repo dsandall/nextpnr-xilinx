@@ -363,6 +363,15 @@ class HeAPPlacer
     std::unordered_map<IdString, CellInfo *> chain_root;
     std::unordered_map<IdString, int> chain_size;
 
+    // Fuzzy boundaries (shortshift docs/126): cached BEL locations of WEAK placement-
+    // hinted cells (filled in seed_placement) + the anchor-spring weight pulling them
+    // back (SPIKE_FUZZY_ANCHOR, default 0.5; 0 disables the spring).
+    std::unordered_map<IdString, Loc> fuzzy_anchor;
+    double fuzzy_anchor_w = [] {
+        const char *p = getenv("SPIKE_FUZZY_ANCHOR");
+        return p ? atof(p) : 0.5;
+    }();
+
     // The offset from chain_root to a cell in the chain
     std::unordered_map<IdString, std::pair<int, int>> cell_offsets;
 
@@ -554,6 +563,12 @@ class HeAPPlacer
                 if (ci->belStrength <= STRENGTH_WEAK && ci->constr_parent == nullptr &&
                     ci->constr_children.empty()) {
                     cell_locs[cell.first].locked = false;
+                    // The cached location is a HINT with a pull force (anchor spring in
+                    // build_equations), not just a solver seed: unanchored WEAK cells
+                    // re-cluster freely and land on routability-infeasible spots inside
+                    // dense frozen regions (cpu_farm: 87/87 moved -> BYP_ALT6 livelock,
+                    // structural — full-tree reroutes of both contestants reconverge).
+                    fuzzy_anchor[cell.first] = loc;
                     ctx->unbindBel(ci->bel);
                     place_cells.push_back(ci);
                 } else {
@@ -774,6 +789,25 @@ class HeAPPlacer
                 // Add an arc from legalised to current position
                 es.add_coeff(row, row, weight);
                 es.add_rhs(row, weight * l_pos);
+            }
+        }
+        // Fuzzy boundaries (shortshift docs/126): anchor spring for placement-hinted
+        // cells — "cached locations as a medium/low strength hint" (owner spec). Same
+        // form as the legalised-position arc above, pulling toward the gen's cached
+        // BEL, so hints move only where the netlist genuinely outpulls the cache.
+        // Weight via SPIKE_FUZZY_ANCHOR (default 0.5; 0 = free/unanchored).
+        if (!fuzzy_anchor.empty() && fuzzy_anchor_w > 0) {
+            for (size_t row = 0; row < solve_cells.size(); row++) {
+                auto fa = fuzzy_anchor.find(solve_cells.at(row)->name);
+                if (fa == fuzzy_anchor.end())
+                    continue;
+                int a_pos = yaxis ? fa->second.y : fa->second.x;
+                int c_pos = cell_pos(solve_cells.at(row));
+                double weight = fuzzy_anchor_w /
+                                std::max<double>(1, (yaxis ? cfg.hpwl_scale_y : cfg.hpwl_scale_x) *
+                                                            std::abs(a_pos - c_pos));
+                es.add_coeff(row, row, weight);
+                es.add_rhs(row, weight * a_pos);
             }
         }
     }

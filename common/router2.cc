@@ -129,11 +129,18 @@ struct Router2
             ripup_depth = atoi(p);
         if (const char *p = getenv("SPIKE_REUSE_EDGE_PENALTY"))
             edge_penalty = float(atof(p));
+        // Livelock breaker (see update_congestion): on for fuzzy-hop binds, or forced
+        // via SPIKE_REUSE_LIVELOCK_BREAK for plain reuse binds that hit the same class.
+        livelock_break = getenv("SPIKE_REUSE_LIVELOCK_BREAK") != nullptr ||
+                         getenv("SPIKE_BIND_FUZZY_HOPS") != nullptr;
     }
 
     float reuse_penalty = 3.0f;   // 8x deadlocked dense-CPU reuse; 3x = seed-not-force default
     int ripup_depth = -1;         // docs/125: tiles from gen bbox edge that stay squishy; <0 = off
     float edge_penalty = 1.0f;    // docs/125: penalty for reused arcs within ripup_depth of the edge
+    bool livelock_break = false;  // docs/126: net-level yield escalation for stuck tiny overuse
+    int livelock_stuck = 0;       // consecutive iters with 0 < overused_wires <= 8
+    int livelock_rounds = 0;      // firings since overuse last hit 0 (round 2+ rips fresh too)
     int _overuse_seen = 0;        // SPIKE_DUMP_OVERUSE: iters with overuse seen, to dump once
 
     // Use 'udata' for fast net lookups and indexing
@@ -1296,6 +1303,51 @@ struct Router2
                 }
                 log_info("[SPIKE_DUMP_OVERUSE] %d overused wires: SITEWIRE=%d INT=%d, "
                          "%d involve a FRESH net\n", overused_wires, nsite, nint, nfresh);
+            }
+        }
+        // Fuzzy boundaries livelock breaker (docs/126): a fresh net (e.g. a moved hint
+        // cell's deferred net) and a reused net can BOTH structurally need one wire
+        // (xc7 BYP_* bypasses are often a pin's only entrance). The reused net yields
+        // arc-locally under the penalty, but its pinned tree forces it straight back —
+        // observed as overuse==1 ping-pong for 900+ iterations on cpu_farm hops=2.
+        // Escalate: when overuse is TINY and stuck for LIVELOCK_ITERS, rip the contested
+        // REUSED nets entirely and clear their reuse status (net-level yield: full
+        // re-route freedom, no penalty steering). Gated on the fuzzy/livelock env so the
+        // unset-knob flow stays bit-identical (the off-switch regression gate).
+        if (livelock_break && overused_wires > 0 && overused_wires <= 8) {
+            livelock_stuck++;
+        } else {
+            livelock_stuck = 0;
+            if (overused_wires == 0)
+                livelock_rounds = 0;
+        }
+        if (livelock_stuck >= 60) {
+            livelock_stuck = 0;
+            livelock_rounds++;
+            for (auto &wire : flat_wires) {
+                if (int(wire.bound_nets.size()) <= 1)
+                    continue;
+                std::vector<int> owners;
+                for (auto &b : wire.bound_nets)
+                    owners.push_back(b.first);
+                for (int ow : owners) {
+                    // Round 1: net-level yield for the REUSED contestants only. If the
+                    // livelock survives that (fresh-vs-fresh: both trees bias their
+                    // contested arc straight back), round 2+ rips EVERY contestant
+                    // full-tree so PathFinder re-solves them globally instead of
+                    // ping-ponging one arc.
+                    if (livelock_rounds < 2 && !nets.at(ow).is_reuse)
+                        continue;
+                    NetInfo *oni = nets_by_udata.at(ow);
+                    log_info("fuzzy: livelock breaker r%d: ripping %s net '%s' "
+                             "(contested %s) — routes fresh from here\n",
+                             livelock_rounds, nets.at(ow).is_reuse ? "reused" : "fresh",
+                             ctx->nameOf(oni), ctx->nameOfWire(wire.w));
+                    for (size_t a = 0; a < nets.at(ow).arcs.size(); a++)
+                        ripup_arc(oni, a);
+                    nets.at(ow).is_reuse = false;
+                    failed_nets.insert(ow);
+                }
             }
         }
         for (int n : failed_nets) {
