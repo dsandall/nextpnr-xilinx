@@ -168,6 +168,9 @@ class HeAPPlacer
             hpwl = total_hpwl();
             log_info("    at initial placer iter %d, wirelen = %d\n", i, int(hpwl));
         }
+        // fuzzy static friction (docs/126): first breakaway evaluation once the initial
+        // solve has settled the movable mass around the stuck hints
+        fuzzy_breakaway_check();
 
         wirelen_t solved_hpwl = 0, spread_hpwl = 0, legal_hpwl = 0, best_hpwl = std::numeric_limits<wirelen_t>::max();
         int iter = 0, stalled = 0;
@@ -249,6 +252,10 @@ class HeAPPlacer
                          int(spread_hpwl), int(legal_hpwl),
                          std::chrono::duration<double>(run_stopt - run_startt).count());
             }
+            // fuzzy static friction (docs/126): re-evaluate after each settled round —
+            // pulls change as the checker converges; newly broken cells join the next
+            // round's solve via setup_solve_cells (rebuilt from place_cells).
+            fuzzy_breakaway_check();
 
             if (cfg.timing_driven)
                 get_criticalities(ctx, &net_crit);
@@ -363,12 +370,13 @@ class HeAPPlacer
     std::unordered_map<IdString, CellInfo *> chain_root;
     std::unordered_map<IdString, int> chain_size;
 
-    // Fuzzy boundaries (shortshift docs/126): cached BEL locations of WEAK placement-
-    // hinted cells (filled in seed_placement) + the anchor-spring weight pulling them
-    // back (SPIKE_FUZZY_ANCHOR, default 0.5; 0 disables the spring).
-    std::unordered_map<IdString, Loc> fuzzy_anchor;
-    double fuzzy_anchor_w = [] {
-        const char *p = getenv("SPIKE_FUZZY_ANCHOR");
+    // Fuzzy boundaries STATIC FRICTION (shortshift docs/126): still-stuck hinted cells
+    // (locked at their cached BEL) -> cached location. A cell leaves this map exactly
+    // once, when its B2B pull exceeds SPIKE_FUZZY_BREAKAWAY (default 0.5) — then it
+    // places completely freely. Cells still here at the end never moved (reuse kept).
+    std::unordered_map<CellInfo *, Loc> fuzzy_stuck;
+    double fuzzy_breakaway = [] {
+        const char *p = getenv("SPIKE_FUZZY_BREAKAWAY");
         return p ? atof(p) : 0.5;
     }();
 
@@ -562,15 +570,19 @@ class HeAPPlacer
                 // behavior is unchanged (the off-switch regression gate).
                 if (ci->belStrength <= STRENGTH_WEAK && ci->constr_parent == nullptr &&
                     ci->constr_children.empty()) {
-                    cell_locs[cell.first].locked = false;
-                    // The cached location is a HINT with a pull force (anchor spring in
-                    // build_equations), not just a solver seed: unanchored WEAK cells
-                    // re-cluster freely and land on routability-infeasible spots inside
-                    // dense frozen regions (cpu_farm: 87/87 moved -> BYP_ALT6 livelock,
-                    // structural — full-tree reroutes of both contestants reconverge).
-                    fuzzy_anchor[cell.first] = loc;
-                    ctx->unbindBel(ci->bel);
-                    place_cells.push_back(ci);
+                    // STATIC FRICTION (docs/126, owner spec): the hinted cell STAYS
+                    // bound+locked at its cached BEL — a stationary object the rest of
+                    // the placement settles around — until the netlist pull on it
+                    // exceeds SPIKE_FUZZY_BREAKAWAY (checked per iteration in
+                    // fuzzy_breakaway_check). Once it breaks, it unbinds and places
+                    // COMPLETELY freely (no residual anchor; one-way latch, like
+                    // static -> kinetic friction). Cells that never break keep their
+                    // exact BEL, so their nets' cached routing rebinds (reuse kept).
+                    // (v1 was an always-on anchor spring: it distorted the solve for
+                    // every hint forever and still let everything drift a little —
+                    // marginal drift forfeits routing reuse for no QoR gain.)
+                    cell_locs[cell.first].locked = true;
+                    fuzzy_stuck[ci] = loc;
                 } else {
                     cell_locs[cell.first].locked = true;
                 }
@@ -791,25 +803,82 @@ class HeAPPlacer
                 es.add_rhs(row, weight * l_pos);
             }
         }
-        // Fuzzy boundaries (shortshift docs/126): anchor spring for placement-hinted
-        // cells — "cached locations as a medium/low strength hint" (owner spec). Same
-        // form as the legalised-position arc above, pulling toward the gen's cached
-        // BEL, so hints move only where the netlist genuinely outpulls the cache.
-        // Weight via SPIKE_FUZZY_ANCHOR (default 0.5; 0 = free/unanchored).
-        if (!fuzzy_anchor.empty() && fuzzy_anchor_w > 0) {
-            for (size_t row = 0; row < solve_cells.size(); row++) {
-                auto fa = fuzzy_anchor.find(solve_cells.at(row)->name);
-                if (fa == fuzzy_anchor.end())
+    }
+
+    // Fuzzy boundaries STATIC FRICTION (docs/126): the B2B pull a stuck hinted cell
+    // would feel at its cached position, per axis — same net model + weights as
+    // build_equations (bound-to-bound arcs, w = 1/(users × scaled distance)).
+    double fuzzy_pull(CellInfo *ci, const Loc &at, bool yaxis)
+    {
+        auto cell_pos = [&](CellInfo *cell) { return yaxis ? cell_locs.at(cell->name).y : cell_locs.at(cell->name).x; };
+        int v = yaxis ? at.y : at.x;
+        double force = 0;
+        for (auto &port : ci->ports) {
+            NetInfo *ni = port.second.net;
+            if (ni == nullptr || ni->driver.cell == nullptr || ni->users.empty())
+                continue;
+            if (cell_locs.count(ni->driver.cell->name) && cell_locs.at(ni->driver.cell->name).global)
+                continue;
+            // find the net's b2b bound ports in this axis
+            PortRef *lbport = nullptr, *ubport = nullptr;
+            int lbpos = std::numeric_limits<int>::max(), ubpos = std::numeric_limits<int>::min();
+            foreach_port(ni, [&](PortRef &pr, int) {
+                if (!cell_locs.count(pr.cell->name))
+                    return;
+                int pos = cell_pos(pr.cell);
+                if (pos < lbpos) {
+                    lbpos = pos;
+                    lbport = &pr;
+                }
+                if (pos > ubpos) {
+                    ubpos = pos;
+                    ubport = &pr;
+                }
+            });
+            if (lbport == nullptr)
+                continue;
+            for (PortRef *other : {lbport, ubport}) {
+                if (other->cell == ci)
                     continue;
-                int a_pos = yaxis ? fa->second.y : fa->second.x;
-                int c_pos = cell_pos(solve_cells.at(row));
-                double weight = fuzzy_anchor_w /
-                                std::max<double>(1, (yaxis ? cfg.hpwl_scale_y : cfg.hpwl_scale_x) *
-                                                            std::abs(a_pos - c_pos));
-                es.add_coeff(row, row, weight);
-                es.add_rhs(row, weight * a_pos);
+                int o_pos = cell_pos(other->cell);
+                double w = 1.0 / (ni->users.size() *
+                                  std::max<double>(1, (yaxis ? cfg.hpwl_scale_y : cfg.hpwl_scale_x) *
+                                                              std::abs(o_pos - v)));
+                force += w * (o_pos - v);
             }
         }
+        return force;
+    }
+
+    // Evaluate friction for every still-stuck hinted cell; break the ones whose pull
+    // exceeds the threshold: unbind, unlock, join place_cells — fully free from here.
+    void fuzzy_breakaway_check()
+    {
+        if (fuzzy_stuck.empty())
+            return;
+        std::vector<CellInfo *> broke;
+        for (auto &fs : fuzzy_stuck) {
+            double fx = fuzzy_pull(fs.first, fs.second, false);
+            double fy = fuzzy_pull(fs.first, fs.second, true);
+            double f = std::max(std::abs(fx), std::abs(fy));
+            if (f > fuzzy_breakaway) {
+                log_info("fuzzy: friction broken on '%s' (pull %.3f > %.3f) — placing freely\n",
+                         ctx->nameOf(fs.first), f, fuzzy_breakaway);
+                broke.push_back(fs.first);
+            } else if (ctx->debug) {
+                log_info("fuzzy: '%s' holds (pull %.3f <= %.3f)\n", ctx->nameOf(fs.first), f, fuzzy_breakaway);
+            }
+        }
+        for (CellInfo *ci : broke) {
+            fuzzy_stuck.erase(ci);
+            if (ci->bel != BelId())
+                ctx->unbindBel(ci->bel);
+            cell_locs[ci->name].locked = false;
+            place_cells.push_back(ci);
+        }
+        if (!broke.empty())
+            log_info("fuzzy: friction summary: %d broke away, %d still holding\n", int(broke.size()),
+                     int(fuzzy_stuck.size()));
     }
 
     // Build the system of equations for either X or Y
