@@ -82,6 +82,11 @@ void arch_wrap_python()
     fn_wrapper_2a<Context, decltype(&Context::bindRoutingLocsChecked), &Context::bindRoutingLocsChecked,
                   pass_through<int>, addr_and_unwrap<NetInfo>, pass_through<std::string>>::def_wrap(
             ctx_cls, "bindRoutingLocsChecked");
+    // fuzzy boundaries (docs/126): free a moved hint-cell's OLD site from the const
+    // net's stale (non-negotiable) ties.
+    fn_wrapper_2a<Context, decltype(&Context::severNetSiteBranches), &Context::severNetSiteBranches,
+                  pass_through<int>, addr_and_unwrap<NetInfo>, pass_through<std::string>>::def_wrap(
+            ctx_cls, "severNetSiteBranches");
 
     WRAP_RANGE(Bel, conv_to_str<BelId>);
     WRAP_RANGE(Wire, conv_to_str<WireId>);

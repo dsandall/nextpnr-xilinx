@@ -24,6 +24,7 @@
 #endif
 
 #include <boost/iostreams/device/mapped_file.hpp>
+#include <set>
 
 #include <iostream>
 
@@ -1267,6 +1268,41 @@ struct Arch : BaseCtx
             }
         }
         return s;
+    }
+
+    // fuzzy boundaries (shortshift docs/126): sever a bound net's branches inside ONE
+    // site (wire-name prefix "SITEWIRE/<site>/") plus everything routed downstream of
+    // them. Used by the fuzzy_rebind pre-route hook on the frozen CONST nets: a WEAK-
+    // hinted cell that MOVED leaves the const net's old site ties (CEUSEDMUX, A6-VCC)
+    // bound at >STRONG strength — non-negotiable, so a fresh arc into that site mux
+    // route-fails. The freed INT spur stays bound (STRONG, yields normally).
+    // Returns the number of wires unbound.
+    int severNetSiteBranches(NetInfo *net, std::string site)
+    {
+        const std::string pfx = "SITEWIRE/" + site + "/";
+        std::set<WireId> dead;
+        for (auto &it : net->wires) {
+            const std::string wn = getWireName(it.first).str(this);
+            if (wn.compare(0, pfx.size(), pfx) == 0)
+                dead.insert(it.first);
+        }
+        if (dead.empty())
+            return 0;
+        bool grew = true;
+        while (grew) {
+            grew = false;
+            for (auto &it : net->wires) {
+                if (dead.count(it.first) || it.second.pip == PipId())
+                    continue;
+                if (dead.count(getPipSrcWire(it.second.pip))) {
+                    dead.insert(it.first);
+                    grew = true;
+                }
+            }
+        }
+        for (WireId w : dead)
+            unbindWire(w);
+        return int(dead.size());
     }
 
     void bindNetRoutingLocs(NetInfo *net, std::string s, PlaceStrength strength)

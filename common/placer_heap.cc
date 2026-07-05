@@ -542,8 +542,23 @@ class HeAPPlacer
                 Loc loc = ctx->getBelLocation(ci->bel);
                 cell_locs[cell.first].x = loc.x;
                 cell_locs[cell.first].y = loc.y;
-                cell_locs[cell.first].locked = true;
                 cell_locs[cell.first].global = ctx->getBelGlobalBuf(ci->bel);
+                // fuzzy boundaries (shortshift docs/126): a WEAK-bound cell is a placement
+                // HINT, not an anchor — its solver position seeds from the cached location
+                // (set above) but it unbinds and places like any movable cell. Without
+                // this, every pre-bound cell was locked here regardless of strength, so
+                // freeze_gen's WEAK hints could never move (cpu_farm hops=8: 4368 hinted,
+                // 0 moved). Chain members keep the anchor (relative legality is not
+                // re-derivable here). Ordinary flows never pre-bind WEAK, so unset-knob
+                // behavior is unchanged (the off-switch regression gate).
+                if (ci->belStrength <= STRENGTH_WEAK && ci->constr_parent == nullptr &&
+                    ci->constr_children.empty()) {
+                    cell_locs[cell.first].locked = false;
+                    ctx->unbindBel(ci->bel);
+                    place_cells.push_back(ci);
+                } else {
+                    cell_locs[cell.first].locked = true;
+                }
             } else if (ci->constr_parent == nullptr) {
                 bool placed = false;
                 while (!placed) {

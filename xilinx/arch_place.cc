@@ -649,8 +649,10 @@ void Arch::fixupPlacement()
         // strength may have MOVED during the bind's placement. Its gen-era site config
         // (LUT pin permutation, const ties) is stale at the new location and its cached
         // routing is forfeited (fuzzy_rebind skips it), so it needs NORMAL legalisation
-        // here -- only frozen cells still at their cached BEL keep the skip.
-        auto it = c->attrs.find(id("NEXTPNR_BEL"));
+        // here -- only frozen cells still at their cached BEL keep the skip. Compare
+        // against FUZZY_ORIG_BEL (immutable, stamped by freeze_gen): NEXTPNR_BEL is
+        // rewritten to the final bel by archInfoToAttributes at the end of place().
+        auto it = c->attrs.find(id("FUZZY_ORIG_BEL"));
         if (it != c->attrs.end() && c->bel != BelId() &&
             getBelName(c->bel).str(getCtx()) != it->second.as_string())
             return false;
