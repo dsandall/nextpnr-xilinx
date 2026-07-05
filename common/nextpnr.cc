@@ -18,6 +18,7 @@
  */
 
 #include "nextpnr.h"
+#include <set>
 #include <boost/algorithm/string.hpp>
 #include "design_utils.h"
 #include "log.h"
@@ -713,39 +714,69 @@ void BaseCtx::attributesToArchInfo()
             // on the same canonical node (xc7 wires are multi-tile nodes -- long LV/LH
             // wires cross region boundaries), so two gens' dumped arcs may claim one dst
             // wire even with zero raw {tile,index} overlap (shortshift docs/123). bindPip
-            // hard-asserts on that, so a net whose locs conflict with an already-bound
-            // net DROPS its reuse entirely and routes fresh -- never a partial bind (a
-            // skipped arc would orphan its downstream subtree).
+            // hard-asserts on that. Sever ONLY the colliding wire and its downstream
+            // subtree (a kept pip whose src was dropped would orphan its branch) and bind
+            // the rest: the router completes just the missing arcs. Dropping the WHOLE
+            // net was tried first and route-fails -- a fresh path through a fully-frozen
+            // CPU interior may not exist, while the severed branch is small (docs/124).
+            // Each record's {wt,wi} is its own canonical dst wire (net->wires keys).
+            std::set<std::pair<int, int>> dead;
             const NetInfo *owner = nullptr;
+            bool root_dead = false;
             for (const auto &e : entries) {
-                if (e.pt < 0) {
-                    WireId w;
-                    w.tile = e.wt;
-                    w.index = e.wi; // roots were dumped canonical (net->wires keys)
-                    NetInfo *o = getCtx()->getBoundWireNet(w);
-                    if (o && o != ni) {
-                        owner = o;
-                        break;
-                    }
-                } else {
+                WireId w;
+                w.tile = e.wt;
+                w.index = e.wi;
+                NetInfo *wo = getCtx()->getBoundWireNet(w);
+                NetInfo *po = nullptr;
+                if (e.pt >= 0) {
                     PipId p;
                     p.tile = e.pt;
                     p.index = e.pi;
-                    NetInfo *po = getCtx()->getBoundPipNet(p);
-                    NetInfo *wo = getCtx()->getBoundWireNet(getCtx()->getPipDstWire(p));
-                    if ((po && po != ni) || (wo && wo != ni)) {
-                        owner = po && po != ni ? po : wo;
-                        break;
+                    po = getCtx()->getBoundPipNet(p);
+                }
+                if ((wo && wo != ni) || (po && po != ni)) {
+                    dead.insert({e.wt, e.wi});
+                    if (!owner)
+                        owner = (wo && wo != ni) ? wo : po;
+                    if (e.pt < 0)
+                        root_dead = true; // source wire itself is taken -- nothing bindable
+                }
+            }
+            // Propagate death downstream: a record whose pip DRIVES FROM a dead wire is
+            // disconnected from the kept tree. Fixpoint loop (records are unordered).
+            if (!dead.empty() && !root_dead) {
+                bool grew = true;
+                while (grew) {
+                    grew = false;
+                    for (const auto &e : entries) {
+                        if (e.pt < 0 || dead.count({e.wt, e.wi}))
+                            continue;
+                        PipId p;
+                        p.tile = e.pt;
+                        p.index = e.pi;
+                        WireId src = getCtx()->getPipSrcWire(p);
+                        if (dead.count({src.tile, src.index})) {
+                            dead.insert({e.wt, e.wi});
+                            grew = true;
+                        }
                     }
                 }
             }
-            if (owner) {
+            if (root_dead) {
                 reuse_conflict_nets++;
                 if (reuse_conflict_nets <= 10)
-                    log_warning("reuse locs conflict: net '%s' overlaps net '%s' already bound from its "
-                                "locs; dropping this net's reused routing (will route fresh)\n",
+                    log_warning("reuse locs conflict: net '%s' source wire is owned by net '%s'; "
+                                "dropping ALL of its reused routing (will route fresh)\n",
                                 nameOf(ni), nameOf(owner));
-                continue; // no REUSE_NET mark either -- it's a plain fresh net now
+                continue; // no REUSE_NET mark -- it's a plain fresh net now
+            }
+            if (!dead.empty()) {
+                reuse_conflict_nets++;
+                if (reuse_conflict_nets <= 10)
+                    log_warning("reuse locs conflict: net '%s' overlaps net '%s'; severing %d of %d "
+                                "arcs (colliding branch reroutes; rest of the tree is kept)\n",
+                                nameOf(ni), nameOf(owner), int(dead.size()), int(entries.size()));
             }
             // Mark REUSE so router2 makes these arcs YIELD under contention (docs/47):
             // independently-P&R'd frozen gens can route onto the same shared global/long
@@ -753,6 +784,8 @@ void BaseCtx::attributesToArchInfo()
             // Harmless for a contention-free faithful round-trip (the router never rips).
             ni->attrs[id("REUSE_NET")] = Property(1);
             for (const auto &e : entries) {
+                if (dead.count({e.wt, e.wi}))
+                    continue;
                 PlaceStrength strength = (PlaceStrength)e.st;
                 if (e.pt < 0)
                     getCtx()->bindWireByLoc(e.wt, e.wi, ni, strength); // root / site-source wire
@@ -780,8 +813,8 @@ void BaseCtx::attributesToArchInfo()
     }
 #ifdef ARCH_XILINX
     if (reuse_conflict_nets > 0)
-        log_warning("reuse locs: dropped cached routing for %d net(s) whose locs conflict with "
-                    "already-bound nets (cross-gen shared-node overlap); they route fresh\n",
+        log_warning("reuse locs: %d net(s) had cross-gen shared-node conflicts; each kept its "
+                    "non-colliding routing tree and reroutes only the severed branch\n",
                     reuse_conflict_nets);
 #endif
     getCtx()->assignArchInfo();
