@@ -446,6 +446,67 @@ struct Router2
         }
     }
 
+    // Fuzzy boundaries DEMAND-DRIVEN YIELD core (docs/126): rip the REUSE nets owning
+    // `dw`'s entrance cone (3 levels uphill: bound wires, reservations, arch-bound
+    // pips), releasing their arch claims + reservations; they reroute with full freedom
+    // (reuse status cleared) and are requeued. SINGLE-THREADED contexts only.
+    // Returns the number of nets ripped.
+    int demand_yield(NetInfo *net, WireId dw)
+    {
+        std::set<int> owners;
+        std::set<WireId> seen{dw};
+        std::vector<WireId> frontier{dw};
+        for (int depth = 0; depth < 3 && !frontier.empty(); depth++) {
+            std::vector<WireId> next;
+            for (WireId fw : frontier) {
+                auto &fwd = wire_data(fw);
+                for (auto bn : fwd.bound_nets)
+                    if (bn.first != net->udata && nets.at(bn.first).is_reuse)
+                        owners.insert(bn.first);
+                if (fwd.reserved_net != -1 && fwd.reserved_net != net->udata &&
+                    nets.at(fwd.reserved_net).is_reuse)
+                    owners.insert(fwd.reserved_net);
+                for (auto uh : ctx->getPipsUphill(fw)) {
+                    NetInfo *po = ctx->getBoundPipNet(uh);
+                    if (po != nullptr && po != net && nets.at(po->udata).is_reuse)
+                        owners.insert(po->udata);
+                    WireId sw2 = ctx->getPipSrcWire(uh);
+                    if (!seen.count(sw2)) {
+                        seen.insert(sw2);
+                        next.push_back(sw2);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        for (int ow : owners) {
+            NetInfo *oni = nets_by_udata.at(ow);
+            log_info("fuzzy: demand yield: ripping reused net '%s' starving sink %s of '%s'\n",
+                     ctx->nameOf(oni), ctx->nameOfWire(dw), ctx->nameOf(net));
+            for (size_t a = 0; a < nets.at(ow).arcs.size(); a++)
+                ripup_arc(oni, a);
+            // release arch-level claims too (rebound nets are arch-bound)
+            std::vector<WireId> awires;
+            for (auto &w : oni->wires)
+                awires.push_back(w.first);
+            for (WireId w : awires)
+                ctx->unbindWire(w);
+            for (auto &ad : nets.at(ow).arcs)
+                ad.routed = false;
+            nets.at(ow).is_reuse = false;
+            failed_nets.insert(ow);
+        }
+        if (!owners.empty()) {
+            // clear reservations the ripped nets held anywhere near the sink
+            for (WireId fw : seen) {
+                auto &fwd = wire_data(fw);
+                if (fwd.reserved_net != -1 && owners.count(fwd.reserved_net))
+                    fwd.reserved_net = -1;
+            }
+        }
+        return int(owners.size());
+    }
+
     void ripup_arc(NetInfo *net, size_t user)
     {
         auto &ad = nets.at(net->udata).arcs.at(user);
@@ -1189,62 +1250,8 @@ struct Router2
                     // and retry the arc once.
                     if (res2 != ARC_SUCCESS && livelock_break) {
                         WireId dw = ctx->getNetinfoSinkWire(net, net->users.at(i));
-                        std::set<int> owners;
-                        std::set<WireId> seen{dw};
-                        std::vector<WireId> frontier{dw};
-                        for (int depth = 0; depth < 3 && !frontier.empty(); depth++) {
-                            std::vector<WireId> next;
-                            for (WireId fw : frontier) {
-                                auto &fwd = wire_data(fw);
-                                for (auto bn : fwd.bound_nets)
-                                    if (bn.first != net->udata && nets.at(bn.first).is_reuse)
-                                        owners.insert(bn.first);
-                                if (fwd.reserved_net != -1 && fwd.reserved_net != net->udata &&
-                                    nets.at(fwd.reserved_net).is_reuse)
-                                    owners.insert(fwd.reserved_net);
-                                for (auto uh : ctx->getPipsUphill(fw)) {
-                                    NetInfo *po = ctx->getBoundPipNet(uh);
-                                    if (po != nullptr && po != net && nets.at(po->udata).is_reuse)
-                                        owners.insert(po->udata);
-                                    WireId sw2 = ctx->getPipSrcWire(uh);
-                                    if (!seen.count(sw2)) {
-                                        seen.insert(sw2);
-                                        next.push_back(sw2);
-                                    }
-                                }
-                            }
-                            frontier = next;
-                        }
-                        if (!owners.empty()) {
-                            for (int ow : owners) {
-                                NetInfo *oni = nets_by_udata.at(ow);
-                                log_info("fuzzy: demand yield: ripping reused net '%s' starving sink %s "
-                                         "of '%s'\n",
-                                         ctx->nameOf(oni), ctx->nameOfWire(dw), ctx->nameOf(net));
-                                for (size_t a = 0; a < nets.at(ow).arcs.size(); a++)
-                                    ripup_arc(oni, a);
-                                // release arch-level claims too (rebound nets are arch-bound)
-                                std::vector<WireId> awires;
-                                for (auto &w : oni->wires)
-                                    awires.push_back(w.first);
-                                for (WireId w : awires)
-                                    ctx->unbindWire(w);
-                                if (nets.at(ow).arcs.size())
-                                    for (auto &ad : nets.at(ow).arcs)
-                                        ad.routed = false;
-                                nets.at(ow).is_reuse = false;
-                                if (wire_data(dw).reserved_net == ow)
-                                    wire_data(dw).reserved_net = -1;
-                                failed_nets.insert(ow);
-                            }
-                            // clear reservations the ripped nets held anywhere near the sink
-                            for (WireId fw : seen) {
-                                auto &fwd = wire_data(fw);
-                                if (fwd.reserved_net != -1 && owners.count(fwd.reserved_net))
-                                    fwd.reserved_net = -1;
-                            }
+                        if (demand_yield(net, dw) > 0)
                             res2 = route_arc(t, net, i, is_mt, false);
-                        }
                     }
                     // If this also fails, no choice but to give up
                     if (res2 != ARC_SUCCESS) {
@@ -1809,6 +1816,54 @@ struct Router2
         setup_wires();
         setup_reuse_groups(); // fuzzy boundaries (docs/125); no-op unless SPIKE_REUSE_RIPUP_DEPTH set
         find_all_reserved_wires();
+        // Fuzzy boundaries PRE-FLIGHT STARVATION SWEEP (docs/126 fast path): an
+        // entrance-starved arc otherwise burns a full A* drain (~2M nodes, seconds of
+        // wall time) just to DETECT the starvation in the failure path — that drain
+        // dominated the armed-mode overhead on AES (+3.7 s / +11.4 s nextpnr). Detect
+        // upfront instead: any unrouted arc whose sink entrances are ALL hard-blocked
+        // (pip arch-bound to another net, pip unavailable, or src wire reserved for
+        // another net) gets the demand yield now, single-threaded, before the loop.
+        if (livelock_break) {
+            int starved = 0, ripped = 0;
+            for (size_t ni_idx = 0; ni_idx < nets_by_udata.size(); ni_idx++) {
+                NetInfo *ni = nets_by_udata.at(ni_idx);
+                auto &nd = nets.at(ni_idx);
+                // only FRESH nets are starvation victims; reuse nets' own unrouted
+                // arcs (sink-remap quirks etc.) self-resolve and must not trigger
+                // yields of innocent neighbours (v1 flagged 1279/2578 arcs and
+                // yielded 43/108 nets — all churn, no runtime win)
+                if (nd.is_reuse)
+                    continue;
+                for (size_t a = 0; a < nd.arcs.size(); a++) {
+                    if (nd.arcs.at(a).routed)
+                        continue;
+                    WireId dw = nd.arcs.at(a).sink_wire;
+                    if (dw == WireId())
+                        continue;
+                    bool any_open = false, any_pip = false;
+                    for (auto uh : ctx->getPipsUphill(dw)) {
+                        any_pip = true;
+                        NetInfo *po = ctx->getBoundPipNet(uh);
+                        if (po != nullptr && po != ni)
+                            continue; // pip owned by another net: hard reject
+                        if (!ctx->checkPipAvail(uh))
+                            continue; // site-mux exclusivity etc.
+                        auto &swd = wire_data(ctx->getPipSrcWire(uh));
+                        if (swd.reserved_net != -1 && swd.reserved_net != int(ni_idx))
+                            continue; // src reserved for another net
+                        any_open = true;
+                        break;
+                    }
+                    if (any_pip && !any_open) {
+                        starved++;
+                        ripped += demand_yield(ni, dw);
+                    }
+                }
+            }
+            if (starved)
+                log_info("fuzzy: pre-flight: %d entrance-starved arc(s), %d reused net(s) yielded\n",
+                         starved, ripped);
+        }
         partition_nets();
         curr_cong_weight = cfg.init_curr_cong_weight;
         hist_cong_weight = cfg.hist_cong_weight;
