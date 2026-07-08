@@ -571,8 +571,13 @@ class HeAPPlacer
                 // 0 moved). Chain members keep the anchor (relative legality is not
                 // re-derivable here). Ordinary flows never pre-bind WEAK, so unset-knob
                 // behavior is unchanged (the off-switch regression gate).
-                if (ci->belStrength <= STRENGTH_WEAK && ci->constr_parent == nullptr &&
-                    ci->constr_children.empty()) {
+                if (ci->belStrength <= STRENGTH_WEAK && ci->constr_parent == nullptr) {
+                    // A WEAK cluster ROOT (constr_children non-empty) is admitted here too:
+                    // its rigid group (e.g. a docs/131 O5/O6 LUT pair) breaks away as ONE
+                    // unit — the children stay bound+locked below until the root breaks,
+                    // then fuzzy_breakaway_check frees them so the cluster re-places
+                    // together. A CHILD (constr_parent != nullptr) still falls to the else
+                    // and stays anchored to its cached bel while the root holds.
                     // STATIC FRICTION (docs/126, owner spec): the hinted cell STAYS
                     // bound+locked at its cached BEL — a stationary object the rest of
                     // the placement settles around — until the netlist pull on it
@@ -866,15 +871,27 @@ class HeAPPlacer
             return;
         std::vector<CellInfo *> broke;
         for (auto &fs : fuzzy_stuck) {
-            double fx = fuzzy_pull(fs.first, fs.second, false);
-            double fy = fuzzy_pull(fs.first, fs.second, true);
+            CellInfo *root = fs.first;
+            double fx = fuzzy_pull(root, fs.second, false);
+            double fy = fuzzy_pull(root, fs.second, true);
+            // A cluster root feels the pull of its whole rigid group (docs/131 O5/O6 pair):
+            // add each child's pull at the child's own cached position, so the pair breaks
+            // when EITHER half is drawn out (e.g. the 5LUT half feeds a moved FF).
+            for (CellInfo *child : root->constr_children) {
+                if (child->bel == BelId() || !cell_locs.count(child->name))
+                    continue;
+                Loc cloc = ctx->getBelLocation(child->bel);
+                fx += fuzzy_pull(child, cloc, false);
+                fy += fuzzy_pull(child, cloc, true);
+            }
             double f = std::max(std::abs(fx), std::abs(fy));
             if (f > fuzzy_breakaway) {
-                log_info("fuzzy: friction broken on '%s' (pull %.3f > %.3f) — placing freely\n",
-                         ctx->nameOf(fs.first), f, fuzzy_breakaway);
-                broke.push_back(fs.first);
+                log_info("fuzzy: friction broken on '%s'%s (pull %.3f > %.3f) — placing freely\n",
+                         ctx->nameOf(root), root->constr_children.empty() ? "" : " (+cluster)",
+                         f, fuzzy_breakaway);
+                broke.push_back(root);
             } else if (ctx->debug) {
-                log_info("fuzzy: '%s' holds (pull %.3f <= %.3f)\n", ctx->nameOf(fs.first), f, fuzzy_breakaway);
+                log_info("fuzzy: '%s' holds (pull %.3f <= %.3f)\n", ctx->nameOf(root), f, fuzzy_breakaway);
             }
         }
         for (CellInfo *ci : broke) {
@@ -882,6 +899,19 @@ class HeAPPlacer
             if (ci->bel != BelId())
                 ctx->unbindBel(ci->bel);
             cell_locs[ci->name].locked = false;
+            ci->region = nullptr;
+            log_info("fuzzy: released region constraint on '%s'%s — HeAP may place it outside the gen region\n",
+                     ctx->nameOf(ci), ci->constr_children.empty() ? "" : " (+cluster)");
+            // Free the rigid children too: unbind + unlock so the cluster re-places as one
+            // unit (the HeAP legaliser places children relative to the root). Leaving them
+            // bound would either lock the root in place or split the fracture.
+            for (CellInfo *child : ci->constr_children) {
+                if (child->bel != BelId())
+                    ctx->unbindBel(child->bel);
+                if (cell_locs.count(child->name))
+                    cell_locs[child->name].locked = false;
+                child->region = nullptr;
+            }
             place_cells.push_back(ci);
         }
         if (!broke.empty())

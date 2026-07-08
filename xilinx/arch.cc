@@ -23,7 +23,9 @@
 #include <boost/range/adaptor/reversed.hpp>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <queue>
+#include <tuple>
 #include "log.h"
 #include "nextpnr.h"
 #include "placer1.h"
@@ -653,6 +655,153 @@ bool Arch::place()
 {
     std::string placer = str_or_default(settings, id("placer"), defaultPlacer);
 
+    auto fuzzy_eighth_clusters = [&]() {
+        struct EighthKey
+        {
+            int x, y, z;
+            bool operator<(const EighthKey &other) const
+            {
+                return std::tie(x, y, z) < std::tie(other.x, other.y, other.z);
+            }
+        };
+        struct EighthCell
+        {
+            CellInfo *cell;
+            Loc loc;
+            bool hinted;
+        };
+        std::map<EighthKey, std::vector<EighthCell>> groups;
+        int hinted_cells = 0;
+
+        for (auto &cell : sorted(cells)) {
+            CellInfo *ci = cell.second;
+            if (ci->bel == BelId() || ci->attrs.count(id("X_FROZEN")) == 0)
+                continue;
+            Loc loc = getBelLocation(ci->bel);
+            int bel_type = loc.z & 0xF;
+            if (bel_type != BEL_6LUT && bel_type != BEL_5LUT && bel_type != BEL_FF && bel_type != BEL_FF2)
+                continue;
+            bool hinted = ci->belStrength <= STRENGTH_WEAK && ci->attrs.count(id("FUZZY_HINT")) != 0;
+            if (hinted)
+                ++hinted_cells;
+            groups[{loc.x, loc.y, loc.z >> 4}].push_back({ci, loc, hinted});
+        }
+        if (hinted_cells == 0)
+            return;
+
+        int clusters = 0, clustered_cells = 0, promoted_roots = 0, macro_excluded = 0;
+        // A LUT6 whose output feeds a wide mux (F7/F8/F9 -> SELMUX2_1 in xc7) or a carry
+        // (CARRY4/CARRY8) is bound across eighths by DEDICATED, non-general routing: the mux/
+        // carry inputs are hardwired to specific LUT.O6 outputs. Relocating such a LUT at
+        // eighth granularity severs that path -> an unroutable O6->mux arc (docs/134). Those
+        // eighths must stay pinned; fuzzy mobility applies only to independent logic. This is
+        // the docs/131 SELMUX/CARRY exclusion, re-enforced here because frozen import drops the
+        // packer's muxf/carry constr relationships, so the co-location grouping cannot see them.
+        auto feeds_hard_macro = [&](CellInfo *ci) -> bool {
+            if (ci->type != id("SLICE_LUTX"))
+                return false;
+            for (auto &port : ci->ports) {
+                if (port.second.type != PORT_OUT || port.second.net == nullptr)
+                    continue;
+                for (auto &usr : port.second.net->users) {
+                    IdString t = usr.cell->type;
+                    if (t == id("SELMUX2_1") || t == id("MUXF7") || t == id("MUXF8") || t == id("MUXF9") ||
+                        t == id("F7MUX") || t == id("F8MUX") || t == id("F9MUX") || t == id("CARRY4") ||
+                        t == id("CARRY8"))
+                        return true;
+                }
+            }
+            return false;
+        };
+        for (auto &group : groups) {
+            auto &members = group.second;
+            bool any_hinted = false;
+            for (auto &m : members)
+                any_hinted = any_hinted || m.hinted;
+            if (!any_hinted || members.size() < 2)
+                continue;
+
+            bool macro_bound = false;
+            for (auto &m : members)
+                if (feeds_hard_macro(m.cell)) {
+                    macro_bound = true;
+                    break;
+                }
+            if (macro_bound) {
+                ++macro_excluded;
+                continue;
+            }
+
+            std::sort(members.begin(), members.end(), [&](const EighthCell &a, const EighthCell &b) {
+                if (a.loc.z != b.loc.z)
+                    return a.loc.z < b.loc.z;
+                return a.cell->name.str(this) < b.cell->name.str(this);
+            });
+
+            CellInfo *root = nullptr;
+            Loc root_loc;
+            for (auto &m : members) {
+                if (m.cell->constr_parent == nullptr && !m.cell->constr_children.empty()) {
+                    root = m.cell;
+                    root_loc = m.loc;
+                    break;
+                }
+            }
+            if (root == nullptr) {
+                for (auto &m : members) {
+                    if (m.cell->constr_parent == nullptr) {
+                        root = m.cell;
+                        root_loc = m.loc;
+                        break;
+                    }
+                }
+            }
+            if (root == nullptr)
+                continue;
+
+            bool already_clustered = !root->constr_children.empty();
+            int children_added = 0;
+            for (auto &m : members) {
+                CellInfo *child = m.cell;
+                if (child == root)
+                    continue;
+                if (child->constr_parent == root)
+                    continue;
+                if (child->constr_parent != nullptr || !child->constr_children.empty())
+                    continue;
+                child->constr_x = 0;
+                child->constr_y = 0;
+                child->constr_z = m.loc.z;
+                child->constr_abs_z = true;
+                child->constr_parent = root;
+                root->constr_children.push_back(child);
+                ++children_added;
+            }
+            if (children_added == 0 && !already_clustered)
+                continue;
+
+            root->constr_abs_z = true;
+            root->constr_z = root_loc.z;
+
+            if (root->belStrength > STRENGTH_WEAK) {
+                root->belStrength = STRENGTH_WEAK;
+                ++promoted_roots;
+            }
+            if (root->attrs.count(id("FUZZY_ORIG_BEL")) == 0)
+                root->attrs[id("FUZZY_ORIG_BEL")] = getBelName(root->bel).str(this);
+            ++clusters;
+            clustered_cells += int(root->constr_children.size()) + 1;
+            log_info("fuzzy: eighth cluster %s/%d root '%s' children=%d%s\n",
+                     chip_info->tile_insts[root->bel.tile].name.get(), group.first.z, nameOf(root),
+                     int(root->constr_children.size()),
+                     root->belStrength <= STRENGTH_WEAK ? " weak-root" : "");
+        }
+        if (clusters > 0 || macro_excluded > 0)
+            log_info("fuzzy: eighth clustering formed %d clusters covering %d cells (%d roots promoted; %d "
+                     "macro-bound eighths pinned)\n",
+                     clusters, clustered_cells, promoted_roots, macro_excluded);
+    };
+
     if (placer == "heap") {
         PlacerHeapCfg cfg(getCtx());
         cfg.criticalityExponent = 7;
@@ -673,6 +822,7 @@ bool Arch::place()
         cfg.cellGroups.back().insert(id_SLICE_LUTX);
         cfg.cellGroups.back().insert(id_SLICE_FFX);
         cfg.cellGroups.back().insert(id_CARRY8);
+        fuzzy_eighth_clusters();
         if (!placer_heap(getCtx(), cfg))
             return false;
     } else if (placer == "sa") {

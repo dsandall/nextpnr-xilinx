@@ -307,6 +307,20 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
     if (lts.cells[(3 << 4) | BEL_5LUT] != nullptr && lts.cells[(3 << 4) | BEL_5LUT]->lutInfo.is_memory)
         small_memory = true;
     NetInfo *wclk = nullptr;
+    auto moved_fuzzy = [&](const CellInfo *c) -> bool {
+        if (c == nullptr || c->attrs.count(id("X_FROZEN")) == 0)
+            return false;
+        auto it = c->attrs.find(id("FUZZY_ORIG_BEL"));
+        if (it == c->attrs.end())
+            return false;
+        return c->bel != BelId() && getBelName(c->bel).str(getCtx()) != it->second.as_string();
+    };
+    auto a6_const = [&](const CellInfo *l) -> bool {
+        if (l == nullptr || !l->ports.count(id_A6))
+            return false;
+        NetInfo *n = l->ports.at(id_A6).net;
+        return n != nullptr && (n->name == id("$PACKER_VCC_NET") || n->name == id("$PACKER_GND_NET"));
+    };
     // Check eight-tiles (mostly LUT-related validity)
     for (int i = 0; i < 8; i++) {
         if (lts.eights[i].dirty) {
@@ -337,17 +351,30 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
                         DBG();
                         return false;
                     }
+                    bool fuzzy_const_a6 = moved_fuzzy(lut6) && a6_const(lut6);
+                    NetInfo *effective_lut6_inputs[6];
+                    int effective_lut6_count = 0;
+                    NetInfo *a6net = nullptr;
+                    if (fuzzy_const_a6) {
+                        auto a6_port = lut6->ports.find(id_A6);
+                        a6net = (a6_port != lut6->ports.end()) ? a6_port->second.net : nullptr;
+                    }
+                    for (int j = 0; j < lut6->lutInfo.input_count; j++) {
+                        if (fuzzy_const_a6 && lut6->lutInfo.input_sigs[j] == a6net)
+                            continue;
+                        effective_lut6_inputs[effective_lut6_count++] = lut6->lutInfo.input_sigs[j];
+                    }
                     // If all 6 inputs or 2 outputs are used, 5LUT can't also be present
-                    if (lut6->lutInfo.input_count == 6 || lut6->lutInfo.output_count == 2) {
+                    if (effective_lut6_count == 6 || lut6->lutInfo.output_count == 2) {
                         DBG();
                         return false;
                     }
                     // If more than 5 total inputs are used, need to check number of shared input
-                    if ((lut6->lutInfo.input_count + lut5->lutInfo.input_count) > 5) {
-                        int shared = 0, need_shared = (lut6->lutInfo.input_count + lut5->lutInfo.input_count - 5);
-                        for (int j = 0; j < lut6->lutInfo.input_count; j++) {
+                    if ((effective_lut6_count + lut5->lutInfo.input_count) > 5) {
+                        int shared = 0, need_shared = (effective_lut6_count + lut5->lutInfo.input_count - 5);
+                        for (int j = 0; j < effective_lut6_count; j++) {
                             for (int k = 0; k < lut5->lutInfo.input_count; k++) {
-                                if (lut6->lutInfo.input_sigs[j] == lut5->lutInfo.input_sigs[k])
+                                if (effective_lut6_inputs[j] == lut5->lutInfo.input_sigs[k])
                                     shared++;
                                 if (shared >= need_shared)
                                     break;
@@ -632,6 +659,25 @@ bool Arch::isValidBelForCell(CellInfo *cell, BelId bel) const
 {
     if (usp_bel_hard_unavail(bel))
         return false;
+    // Fuzzy co-move (shortshift docs/131 Phase 0): a fuzzy-hinted LUT that MOVED from its
+    // cached bel must land on the SAME 5LUT/6LUT half-class. LUT bels come in paired 5LUT
+    // (O5) and 6LUT (O6) halves with disjoint extra pins; relocating a fractured 5LUT onto
+    // a 6LUT half leaves its O5 output unwireable ("No wire found for port O5"). This guard
+    // is exactly what lets LUTs be fuzzy-hinted at all (freeze_gen used to exclude them for
+    // this reason). It constrains ONLY LUT cells carrying FUZZY_ORIG_BEL (the immutable
+    // move-reference stamped by freeze_gen); non-fuzzy placement is unaffected.
+    if (cell->type == id_SLICE_LUTX) {
+        auto it = cell->attrs.find(id("FUZZY_ORIG_BEL"));
+        if (it != cell->attrs.end()) {
+            BelId orig = getBelByName(id(it->second.as_string()));
+            if (orig != BelId()) {
+                bool orig5 = (locInfo(orig).bel_data[orig.index].z & 0xF) == BEL_5LUT;
+                bool cand5 = (locInfo(bel).bel_data[bel.index].z & 0xF) == BEL_5LUT;
+                if (orig5 != cand5)
+                    return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -658,6 +704,14 @@ void Arch::fixupPlacement()
             return false;
         return true;
     };
+    auto moved_fuzzy = [&](const CellInfo *c) {
+        if (c == nullptr || c->attrs.count(id("X_FROZEN")) == 0)
+            return false;
+        auto it = c->attrs.find(id("FUZZY_ORIG_BEL"));
+        if (it == c->attrs.end())
+            return false;
+        return c->bel != BelId() && getBelName(c->bel).str(getCtx()) != it->second.as_string();
+    };
     for (auto &ts : tileStatus) {
         if (ts.lts == nullptr)
             continue;
@@ -673,9 +727,14 @@ void Arch::fixupPlacement()
                     lut5Inputs[lut5->lutInfo.input_sigs[i]->name].push_back(i);
             CellInfo *lut6 = lt.cells[z << 4 | BEL_6LUT];
             if (lut6) {
-                for (int i = 0; i < lut6->lutInfo.input_count; i++)
-                    if (lut6->lutInfo.input_sigs[i])
-                        lut6Inputs[lut6->lutInfo.input_sigs[i]->name].push_back(i);
+                for (int i = 0; i < lut6->lutInfo.input_count; i++) {
+                    NetInfo *s = lut6->lutInfo.input_sigs[i];
+                    if (s == nullptr)
+                        continue;
+                    if (moved_fuzzy(lut6) && (s->name == id("$PACKER_VCC_NET") || s->name == id("$PACKER_GND_NET")))
+                        continue;
+                    lut6Inputs[s->name].push_back(i);
+                }
             }
             if (lut5->lutInfo.is_memory || lut5->lutInfo.is_srl) {
                 if (lut6) {
