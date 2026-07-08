@@ -38,4 +38,6 @@ install_manifest.txt
 *.mf
 *.bba
 __pycache__/
-*.pycbuild-fuzzy/
+*.pyc
+build-fuzzy/
+build-gui/

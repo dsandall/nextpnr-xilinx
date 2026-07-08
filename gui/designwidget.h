@@ -79,13 +79,14 @@ class DesignWidget : public QWidget
     void highlight(std::vector<DecalXY> decal, int group);
     void hover(DecalXY decal);
     void zoomSelected();
+    void zoomToDecals(std::vector<DecalXY> decals);
 
   private Q_SLOTS:
     void prepareMenuProperty(const QPoint &pos);
     void prepareMenuTree(int num, const QPoint &pos);
     void onSelectionChanged(int num, const QItemSelection &selected, const QItemSelection &deselected);
     void onItemDoubleClicked(QTreeWidgetItem *item, int column);
-    void onDoubleClicked(const QModelIndex &index);
+    void onDoubleClicked(int num, const QModelIndex &index);
     void onSearchInserted();
     void onHoverIndexChanged(int num, QModelIndex index);
     void onHoverPropertyChanged(QtBrowserItem *item);

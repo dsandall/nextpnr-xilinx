@@ -108,6 +108,7 @@ BaseMainWindow::BaseMainWindow(std::unique_ptr<Context> context, CommandHandler 
     // Propagate events from design view to device view
     connect(designview, &DesignWidget::selected, fpgaView, &FPGAViewWidget::onSelectedArchItem);
     connect(designview, &DesignWidget::zoomSelected, fpgaView, &FPGAViewWidget::zoomSelected);
+    connect(designview, &DesignWidget::zoomToDecals, fpgaView, &FPGAViewWidget::zoomToDecals);
     connect(designview, &DesignWidget::highlight, fpgaView, &FPGAViewWidget::onHighlightGroupChanged);
     connect(designview, &DesignWidget::hover, fpgaView, &FPGAViewWidget::onHoverItemChanged);
 
@@ -189,6 +190,25 @@ void BaseMainWindow::createMenusAndBars()
     actionExecutePy->setStatusTip("Execute Python script");
     actionExecutePy->setEnabled(true);
     connect(actionExecutePy, &QAction::triggered, this, &BaseMainWindow::execute_python);
+
+    // Split-flow bind stages, only when a prep script is provided via env
+    // (tools/view_bind_live.sh sets SPIKE_GUI_PREP to the generated hook runner).
+    if (getenv("SPIKE_GUI_PREP")) {
+        actionBindPrep = new QAction("Lock Gens", this);
+        actionBindPrep->setIcon(QIcon(":/icons/resources/lock_gens.png"));
+        actionBindPrep->setStatusTip("Bind stage: run the split-flow lock hooks (after Pack, before Place)");
+        actionBindPrep->setEnabled(false);
+        connect(actionBindPrep, &QAction::triggered, this, &BaseMainWindow::runBindPrep);
+
+        actionRunBind = new QAction("Run Bind", this);
+        actionRunBind->setIcon(QIcon(":/icons/resources/run_bind.png"));
+        actionRunBind->setStatusTip("Run the whole bind: Pack, lock gens, Place, Route");
+        actionRunBind->setEnabled(false);
+        connect(actionRunBind, &QAction::triggered, this, [this] {
+            autoBind_ = true;
+            Q_EMIT task->pack();
+        });
+    }
 
     // Worker control toolbar actions
     actionPlay = new QAction("Play", this);
@@ -288,11 +308,15 @@ void BaseMainWindow::createMenusAndBars()
     menuFile->addSeparator();
     menuFile->addAction(actionExit);
 
-    // Add Design menu actions
+    // Add Design menu actions (bind stages sit in flow order: pack -> lock -> place -> route -> bind)
     menuDesign->addAction(actionPack);
+    if (actionBindPrep)
+        menuDesign->addAction(actionBindPrep);
     menuDesign->addAction(actionAssignBudget);
     menuDesign->addAction(actionPlace);
     menuDesign->addAction(actionRoute);
+    if (actionRunBind)
+        menuDesign->addAction(actionRunBind);
     menuDesign->addSeparator();
     menuDesign->addAction(actionExecutePy);
 
@@ -307,9 +331,13 @@ void BaseMainWindow::createMenusAndBars()
     mainActionBar->addAction(actionSaveJSON);
     mainActionBar->addSeparator();
     mainActionBar->addAction(actionPack);
+    if (actionBindPrep)
+        mainActionBar->addAction(actionBindPrep);
     mainActionBar->addAction(actionAssignBudget);
     mainActionBar->addAction(actionPlace);
     mainActionBar->addAction(actionRoute);
+    if (actionRunBind)
+        mainActionBar->addAction(actionRunBind);
     mainActionBar->addAction(actionExecutePy);
 
     // Add worker control toolbar
@@ -416,6 +444,15 @@ void BaseMainWindow::saveMovie()
         fpgaView->movieStop();
     }
 }
+void BaseMainWindow::runBindPrep()
+{
+    const char *prep = getenv("SPIKE_GUI_PREP");
+    if (!prep)
+        return;
+    log("Running bind prep: %s\n", prep);
+    console->execute_python(prep);
+}
+
 void BaseMainWindow::pack_finished(bool status)
 {
     disableActions();
@@ -423,8 +460,13 @@ void BaseMainWindow::pack_finished(bool status)
         log("Packing design successful.\n");
         Q_EMIT updateTreeView();
         updateActions();
+        if (autoBind_) {
+            runBindPrep();
+            Q_EMIT task->place(timing_driven);
+        }
     } else {
         log("Packing design failed.\n");
+        autoBind_ = false;
     }
 }
 
@@ -446,12 +488,16 @@ void BaseMainWindow::place_finished(bool status)
         log("Placing design successful.\n");
         Q_EMIT updateTreeView();
         updateActions();
+        if (autoBind_)
+            Q_EMIT task->route();
     } else {
         log("Placing design failed.\n");
+        autoBind_ = false;
     }
 }
 void BaseMainWindow::route_finished(bool status)
 {
+    autoBind_ = false;
     disableActions();
     if (status) {
         log("Routing design successful.\n");
@@ -464,6 +510,7 @@ void BaseMainWindow::route_finished(bool status)
 void BaseMainWindow::taskCanceled()
 {
     log("CANCELED\n");
+    autoBind_ = false;
     disableActions();
 }
 
@@ -501,6 +548,10 @@ void BaseMainWindow::disableActions()
     actionAssignBudget->setEnabled(false);
     actionPlace->setEnabled(false);
     actionRoute->setEnabled(false);
+    if (actionBindPrep) {
+        actionBindPrep->setEnabled(false);
+        actionRunBind->setEnabled(false);
+    }
 
     actionExecutePy->setEnabled(true);
 
@@ -520,6 +571,12 @@ void BaseMainWindow::updateActions()
         actionPlace->setEnabled(true);
     } else if (ctx->settings.find(ctx->id("route")) == ctx->settings.end())
         actionRoute->setEnabled(true);
+
+    if (actionBindPrep) {
+        // Lock Gens slots between Pack and Place; Run Bind kicks off from unpacked.
+        actionBindPrep->setEnabled(actionPlace->isEnabled());
+        actionRunBind->setEnabled(actionPack->isEnabled());
+    }
 
     onUpdateActions();
 }

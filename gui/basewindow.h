@@ -73,6 +73,7 @@ class BaseMainWindow : public QMainWindow
     void place();
 
     void execute_python();
+    void runBindPrep();
 
     void pack_finished(bool status);
     void budget_finish(bool status);
@@ -120,6 +121,12 @@ class BaseMainWindow : public QMainWindow
     QAction *actionAssignBudget;
     QAction *actionPlace;
     QAction *actionRoute;
+
+    // Split-flow bind stages (created only when SPIKE_GUI_PREP is set — see
+    // tools/view_bind_live.sh): run the bind lock hooks / the whole bind chain.
+    QAction *actionBindPrep = nullptr;
+    QAction *actionRunBind = nullptr;
+    bool autoBind_ = false;
 
     QAction *actionExecutePy;
 

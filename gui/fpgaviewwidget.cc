@@ -583,10 +583,26 @@ void FPGAViewWidget::renderLines(void)
         rendererData_->gfxHovered.last_render++;
 
         // Render highlighted.
+        // Split-flow region view (SPIKE_GUI_REGION_BOX): frame each highlight group's
+        // bounding box in the group's color — with SPIKE_GUI_HIGHLIGHT coloring a gen
+        // per group, the frame is the gen's placed footprint (the same box the bind's
+        // confinement derives from the frozen BELs).
+        const bool regionBoxes = getenv("SPIKE_GUI_REGION_BOX") != nullptr;
         for (int i = 0; i < 8; i++) {
             rendererData_->gfxHighlighted[i].clear();
+            PickQuadTree::BoundingBox bbGroup;
+            bbGroup.clear();
             for (auto &decal : highlightedDecals[i]) {
-                renderDecal(rendererData_->gfxHighlighted[i], rendererData_->bbGlobal, decal);
+                renderDecal(rendererData_->gfxHighlighted[i], bbGroup, decal);
+            }
+            if (regionBoxes && bbGroup.x0() != std::numeric_limits<float>::infinity()) {
+                const float m = 0.6f;
+                const float x0 = bbGroup.x0() - m, y0 = bbGroup.y0() - m;
+                const float x1 = bbGroup.x1() + m, y1 = bbGroup.y1() + m;
+                PolyLine(x0, y0, x1, y0).build(rendererData_->gfxHighlighted[i]);
+                PolyLine(x1, y0, x1, y1).build(rendererData_->gfxHighlighted[i]);
+                PolyLine(x1, y1, x0, y1).build(rendererData_->gfxHighlighted[i]);
+                PolyLine(x0, y1, x0, y0).build(rendererData_->gfxHighlighted[i]);
             }
             rendererData_->gfxHighlighted[i].last_render++;
         }
@@ -909,6 +925,33 @@ void FPGAViewWidget::zoomSelected()
         if (rendererData_->bbSelected.x0() != std::numeric_limits<float>::infinity())
             zoomToBB(rendererData_->bbSelected, 0.5f, true);
     }
+    update();
+}
+
+void FPGAViewWidget::zoomToDecals(std::vector<DecalXY> decals)
+{
+    // Synchronous zoom-to-item: build the bbox from the decals directly instead of
+    // reading rendererData_->bbSelected, which only updates after the next renderer
+    // pass (so a zoom fired on double-click would act on stale/empty state).
+    LineShaderData scratch;
+    PickQuadTree::BoundingBox bb;
+    bb.clear();
+    for (auto &decal : decals)
+        renderDecal(scratch, bb, decal);
+    if (bb.x0() == std::numeric_limits<float>::infinity()) {
+        // Decals with hidden/empty graphics (pseudo bels on NULL tiles, etc.) leave
+        // the bbox untouched — fall back to the decal origins so the zoom still
+        // lands on the right tile.
+        for (auto &decal : decals) {
+            bb.setX0(std::min(bb.x0(), decal.x));
+            bb.setY0(std::min(bb.y0(), decal.y));
+            bb.setX1(std::max(bb.x1(), decal.x + 1));
+            bb.setY1(std::max(bb.y1(), decal.y + 1));
+        }
+        if (bb.x0() == std::numeric_limits<float>::infinity())
+            return;
+    }
+    zoomToBB(bb, 0.5f, true);
     update();
 }
 

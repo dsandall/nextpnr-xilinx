@@ -118,6 +118,7 @@ class FPGAViewWidget : public QOpenGLWidget, protected QOpenGLFunctions
     void zoomIn();
     void zoomOut();
     void zoomSelected();
+    void zoomToDecals(std::vector<DecalXY> decals);
     void zoomOutbound();
     void enableDisableDecals(bool bels, bool wires, bool pips, bool groups);
     void movieStart(QString dir, long frameSkip, bool skipSame);

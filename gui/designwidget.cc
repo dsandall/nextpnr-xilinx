@@ -19,6 +19,8 @@
  */
 
 #include "designwidget.h"
+#include <cstdlib>
+#include <sstream>
 #include <QAction>
 #include <QApplication>
 #include <QGridLayout>
@@ -225,7 +227,8 @@ DesignWidget::DesignWidget(QWidget *parent) : QWidget(parent), ctx(nullptr)
     for (int num = 0; num < 6; num++) {
         connect(treeView[num], &TreeView::customContextMenuRequested,
                 [this, num](const QPoint &pos) { prepareMenuTree(num, pos); });
-        connect(treeView[num], &TreeView::doubleClicked, [this](const QModelIndex &index) { onDoubleClicked(index); });
+        connect(treeView[num], &TreeView::doubleClicked,
+                [this, num](const QModelIndex &index) { onDoubleClicked(num, index); });
         connect(treeView[num], &TreeView::hoverIndexChanged,
                 [this, num](QModelIndex index) { onHoverIndexChanged(num, index); });
         selectionModel[num] = treeView[num]->selectionModel();
@@ -386,6 +389,43 @@ void DesignWidget::updateTree()
 
         getTreeByElementType(ElementType::CELL)->updateElements(cells);
         getTreeByElementType(ElementType::NET)->updateElements(nets);
+    }
+
+    // Auto-highlight cells by hierarchy prefix: SPIKE_GUI_HIGHLIGHT="<prefix>:<group 0-7>[,...]"
+    // (e.g. "$flatten\u_genA.:0,$flatten\u_genB.:1"). Split-flow viewer aid — colors each
+    // gen's cells without hand-selecting hundreds of tree items; reapplied after every task
+    // so the coloring survives pack/place/route.
+    if (const char *spec = getenv("SPIKE_GUI_HIGHLIGHT")) {
+        QList<TreeModel::Item *> group_items[8];
+        std::vector<std::pair<std::string, int>> prefixes;
+        std::stringstream ss(spec);
+        std::string entry;
+        while (std::getline(ss, entry, ',')) {
+            auto colon = entry.rfind(':');
+            if (colon == std::string::npos)
+                continue;
+            int group = std::atoi(entry.substr(colon + 1).c_str());
+            if (group >= 0 && group < 8)
+                prefixes.emplace_back(entry.substr(0, colon), group);
+        }
+        {
+            std::lock_guard<std::mutex> lock_ui(ctx->ui_mutex);
+            std::lock_guard<std::mutex> lock(ctx->mutex);
+            for (auto &pair : ctx->cells) {
+                const std::string name = pair.first.str(ctx);
+                for (auto &p : prefixes) {
+                    if (name.compare(0, p.first.size(), p.first) == 0) {
+                        auto node = getTreeByElementType(ElementType::CELL)->nodeForId(pair.first);
+                        if (node)
+                            group_items[p.second].append(*node);
+                        break;
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < 8; i++)
+            if (!group_items[i].empty())
+                updateHighlightGroup(group_items[i], i);
     }
 }
 QtProperty *DesignWidget::addTopLevelProperty(const QString &id)
@@ -1017,7 +1057,18 @@ void DesignWidget::onItemDoubleClicked(QTreeWidgetItem *item, int column)
     }
 }
 
-void DesignWidget::onDoubleClicked(const QModelIndex &index) { Q_EMIT zoomSelected(); }
+void DesignWidget::onDoubleClicked(int num, const QModelIndex &index)
+{
+    if (!index.isValid())
+        return;
+    TreeModel::Item *item = treeModel[num]->nodeFromIndex(index);
+    if (!item)
+        return;
+    // Zoom from the item's own decals instead of the renderer's bbSelected, which lags
+    // a render pass behind the click (making double-click zoom a no-op on xilinx-scale
+    // fabrics where that pass takes seconds).
+    Q_EMIT zoomToDecals(getDecals(item->type(), item->id()));
+}
 
 void DesignWidget::onSearchInserted()
 {

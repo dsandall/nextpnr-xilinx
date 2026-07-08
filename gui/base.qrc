@@ -18,6 +18,8 @@
         <file>resources/control_pause.png</file>
         <file>resources/control_stop.png</file>
         <file>resources/pack.png</file>
+        <file>resources/lock_gens.png</file>
+        <file>resources/run_bind.png</file>
         <file>resources/place.png</file>
         <file>resources/route.png</file>
         <file>resources/time_add.png</file>
