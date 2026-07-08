@@ -976,6 +976,8 @@ bool Arch::pack()
 
     assignArchInfo();
     attrs[id("step")] = std::string("pack");
+    // Mirror Arch::route(): the GUI's updateActions() gates Place on this flag.
+    getCtx()->settings[getCtx()->id("pack")] = 1;
     archInfoToAttributes();
     return true;
 }

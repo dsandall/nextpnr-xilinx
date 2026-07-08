@@ -833,6 +833,8 @@ bool Arch::place()
     }
     fixupPlacement();
     getCtx()->attrs[getCtx()->id("step")] = std::string("place");
+    // Mirror Arch::route(): the GUI's updateActions() gates Route on this flag.
+    getCtx()->settings[getCtx()->id("place")] = 1;
     archInfoToAttributes();
     return true;
 }
