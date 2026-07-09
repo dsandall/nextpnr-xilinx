@@ -950,6 +950,9 @@ bool Arch::pack()
         packer.pack_ffs();
         packer.finalise_muxfs();
         packer.pack_lutffs();
+        // Run after all IO/clocking packing so the final IBUF/BUFGCTRL net
+        // topology exists; STA and budget assignment read clkconstr after pack.
+        packer.propagate_clock_constraints();
     } else {
         USPacker packer;
         packer.ctx = getCtx();

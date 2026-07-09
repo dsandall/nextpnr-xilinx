@@ -243,6 +243,11 @@ struct XC7Packer : public XilinxPacker
     void pack_plls();
     void pack_gbs();
     void pack_clocking();
+    // Copy create_clock constraints forward through 1:1 clock buffers
+    // (INBUF/BUFGCTRL/BUFH) so the post-BUFG derived clock net is constrained by
+    // the XDC period instead of falling back to the --freq default (docs/54;
+    // split-flow D6). Period-transforming cells (PLL/MMCM/BUFR) are not crossed.
+    void propagate_clock_constraints();
 
     // CFG
     void pack_cfg();

@@ -160,4 +160,58 @@ void XC7Packer::pack_clocking()
     pack_gbs();
 }
 
+void XC7Packer::propagate_clock_constraints()
+{
+    // create_clock lands on the top port net (the XDC is parsed pre-pack), but the
+    // domain STA actually times is the net behind the IBUF -> BUFG chain. Upstream
+    // nextpnr copies clkconstr through the global buffers on ice40 (pack.cc SB_GB /
+    // insert_global); the xilinx arch never did, so the derived clock net silently
+    // fell back to the --freq default (12 MHz) and the XDC period was fiction for
+    // the real datapath (docs/54, split-flow D6). Copy constraints forward through
+    // 1:1 clock buffers to a fixpoint. Period-transforming cells (PLL/MMCM, BUFR
+    // with a divide) are deliberately NOT crossed: their output periods are derived,
+    // not equal, and are out of scope here.
+    log_info("Propagating clock constraints through clock buffers...\n");
+    int copied = 0;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (auto cell : sorted(ctx->cells)) {
+            CellInfo *ci = cell.second;
+            const std::string type = ci->type.str(ctx);
+            // (input pin, output pin) pairs this cell forwards a clock through 1:1
+            std::vector<std::pair<IdString, IdString>> pairs;
+            if (ci->type == id_BUFGCTRL) {
+                pairs.emplace_back(ctx->id("I0"), ctx->id("O"));
+                pairs.emplace_back(ctx->id("I1"), ctx->id("O"));
+            } else if (ci->type == id_BUFG_BUFG || ci->type == id_BUFHCE_BUFHCE) {
+                pairs.emplace_back(ctx->id("I"), ctx->id("O"));
+            } else if (type.find("INBUF") != std::string::npos) {
+                // IOB33[MS]?_INBUF_EN / IOB18[MS]?_INBUF_DCIEN (post-decompose_iob)
+                pairs.emplace_back(ctx->id("PAD"), ctx->id("OUT"));
+            } else {
+                continue;
+            }
+            for (auto &p : pairs) {
+                NetInfo *in = get_net_or_empty(ci, p.first);
+                NetInfo *out = get_net_or_empty(ci, p.second);
+                if (in == nullptr || out == nullptr || in->clkconstr == nullptr || out->clkconstr != nullptr)
+                    continue;
+                out->clkconstr = std::unique_ptr<ClockConstraint>(new ClockConstraint());
+                out->clkconstr->period = in->clkconstr->period;
+                out->clkconstr->high = in->clkconstr->high;
+                out->clkconstr->low = in->clkconstr->low;
+                log_info("    net '%s' gets period %.2f ns (%.2f MHz) through %s '%s'\n", out->name.c_str(ctx),
+                         ctx->getDelayNS(out->clkconstr->period.minDelay()),
+                         1000.0 / ctx->getDelayNS(out->clkconstr->period.minDelay()), type.c_str(),
+                         ci->name.c_str(ctx));
+                copied++;
+                changed = true;
+            }
+        }
+    }
+    if (copied == 0)
+        log_info("    no clock constraints to propagate\n");
+}
+
 NEXTPNR_NAMESPACE_END
