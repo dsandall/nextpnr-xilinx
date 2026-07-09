@@ -30,9 +30,12 @@
 #include <algorithm>
 #include <boost/container/flat_map.hpp>
 #include <chrono>
+#include <cstring>
 #include <deque>
 #include <fstream>
+#include <map>
 #include <queue>
+#include <set>
 #include <thread>
 #include "log.h"
 #include "nextpnr.h"
@@ -136,6 +139,42 @@ struct Router2
         return p ? atoi(p) : 64;       // aes_gen cascaded into a STAGNANT 28-wire set (>8)
     }();
     int _overuse_seen = 0;        // SPLIT_DUMP_OVERUSE: iters with overuse seen, to dump once
+
+    // D1 Phase-0 overuse-plateau diagnostic (docs/140 D1 = docs/131 Phase-0, repointed).
+    // SPLIT_OVERUSE_TRACE=1: once the overused set is small (<= SPLIT_OVERUSE_TRACE_MAXW,
+    // default 256), emit one machine-parseable [d1w] line per overused wire per iteration
+    // (wire identity + xy + contesting nets + reuse flag) so churn-vs-capacity is
+    // computable offline, and every SPLIT_OVERUSE_TRACE_EVERY banded iters (default 25)
+    // dump a full snapshot: [d1o] per-wire entrance-cone capacity (demand_yield's 3-level
+    // uphill cone: free/bound/reserved/unavailable counts), [d1p] cumulative per-wire
+    // overuse persistence, [d1n]/[d1c] every net ever seen contesting + its cells with
+    // FUZZY_HINT/X_FROZEN/bel provenance. The dump also fires just before a fatal arc
+    // failure and at the iteration limit. SPLIT_ROUTER_ITER_LIMIT=N: bounded diagnostic
+    // abort — the main loop otherwise never gives up on a persistent plateau (docs/126).
+    // All of it is OFF unless the envs are set: zero behavior change for normal flows
+    // (unset/""/"0" = off, docs/146 convention).
+    static bool d1_env_flag(const char *name)
+    {
+        const char *p = getenv(name);
+        return p != nullptr && *p != '\0' && strcmp(p, "0") != 0;
+    }
+    bool d1_trace = d1_env_flag("SPLIT_OVERUSE_TRACE");
+    int d1_trace_maxw = [] {
+        const char *p = getenv("SPLIT_OVERUSE_TRACE_MAXW");
+        return p ? atoi(p) : 256;
+    }();
+    int d1_dump_every = [] {
+        const char *p = getenv("SPLIT_OVERUSE_TRACE_EVERY");
+        return p ? atoi(p) : 25;
+    }();
+    int d1_iter_limit = [] {
+        const char *p = getenv("SPLIT_ROUTER_ITER_LIMIT");
+        return p ? atoi(p) : -1;
+    }();
+    int d1_iter = 0;                   // current main-loop iteration (set each iter)
+    int d1_band_iters = 0;             // iterations spent inside the traced band
+    std::map<WireId, int> d1_wire_iters; // wire -> #iterations seen overused (in band)
+    std::set<int> d1_net_udatas;       // cumulative contesting nets (udata), in band
 
     // Use 'udata' for fast net lookups and indexing
     std::vector<NetInfo *> nets_by_udata;
@@ -1212,6 +1251,10 @@ struct Router2
                                      int(ctx->usp_pip_hard_unavail(dh)), own ? ctx->nameOf(own) : "-",
                                      ctx->nameOfWire(ctx->getPipDstWire(dh)));
                         }
+                        // D1 Phase-0: snapshot the contention state before dying so an
+                        // arc-fatal end (vs a plateau) still yields the analysis dump.
+                        if (d1_trace)
+                            d1_dump("arc-fatal");
                         log_error("Failed to route arc %d of net '%s', from %s to %s.\n", int(i), ctx->nameOf(net),
                                   ctx->nameOfWire(ctx->getNetinfoSourceWire(net)),
                                   ctx->nameOfWire(ctx->getNetinfoSinkWire(net, net->users.at(i))));
@@ -1233,6 +1276,93 @@ struct Router2
     int total_overuse = 0;
     std::vector<int> route_queue;
     std::set<int> failed_nets;
+
+    // D1 Phase-0: full contention snapshot (see the knob comment near d1_trace).
+    // Emitted line classes (all machine-parseable, one record per line):
+    //   [d1o] currently-overused wire + its entrance-cone capacity (the SAME 3-level
+    //         uphill cone demand_yield rips), each distinct wire reached classified
+    //         free / bound / reserved / unavailable;
+    //   [d1p] cumulative per-wire overuse persistence over the traced band;
+    //   [d1n] each net ever seen contesting (reuse flag, fail count, cell counts);
+    //   [d1c] that net's cells with FUZZY_HINT depth / X_FROZEN / bel provenance.
+    void d1_dump(const char *reason)
+    {
+        log_info("[d1] DUMP reason=%s iter=%d overused=%d band_iters=%d cum_wires=%d cum_nets=%d\n",
+                 reason, d1_iter, overused_wires, d1_band_iters, int(d1_wire_iters.size()),
+                 int(d1_net_udatas.size()));
+        for (auto &wire : flat_wires) {
+            if (int(wire.bound_nets.size()) <= 1)
+                continue;
+            int cw_total = 0, cw_free = 0, cw_bound = 0, cw_resv = 0, cw_unavail = 0;
+            std::set<WireId> seen{wire.w};
+            std::vector<WireId> frontier{wire.w};
+            for (int depth = 0; depth < 3 && !frontier.empty(); depth++) {
+                std::vector<WireId> next;
+                for (WireId fw : frontier) {
+                    for (auto uh : ctx->getPipsUphill(fw)) {
+                        WireId sw = ctx->getPipSrcWire(uh);
+                        if (seen.count(sw))
+                            continue;
+                        seen.insert(sw);
+                        next.push_back(sw);
+                        auto &swd = wire_data(sw);
+                        cw_total++;
+                        if (swd.unavailable)
+                            cw_unavail++;
+                        else if (!swd.bound_nets.empty())
+                            cw_bound++;
+                        else if (swd.reserved_net != -1)
+                            cw_resv++;
+                        else
+                            cw_free++;
+                    }
+                }
+                frontier = next;
+            }
+            log_info("[d1o] wire=%s x=%d y=%d nnets=%d cone_total=%d cone_free=%d cone_bound=%d "
+                     "cone_resv=%d cone_unavail=%d\n",
+                     ctx->nameOfWire(wire.w), wire.x, wire.y, int(wire.bound_nets.size()), cw_total,
+                     cw_free, cw_bound, cw_resv, cw_unavail);
+        }
+        for (auto &kv : d1_wire_iters) {
+            auto &wd = wire_data(kv.first);
+            log_info("[d1p] wire=%s x=%d y=%d iters=%d\n", ctx->nameOfWire(kv.first), wd.x, wd.y,
+                     kv.second);
+        }
+        IdString id_hint = ctx->id("FUZZY_HINT");
+        IdString id_frozen = ctx->id("X_FROZEN");
+        IdString id_orig = ctx->id("FUZZY_ORIG_BEL");
+        for (int n : d1_net_udatas) {
+            NetInfo *ni = nets_by_udata.at(n);
+            auto &nd = nets.at(n);
+            std::set<CellInfo *> cells;
+            if (ni->driver.cell != nullptr)
+                cells.insert(ni->driver.cell);
+            for (auto &u : ni->users)
+                if (u.cell != nullptr)
+                    cells.insert(u.cell);
+            int nhint = 0;
+            for (CellInfo *c : cells)
+                if (c->attrs.count(id_hint))
+                    nhint++;
+            log_info("[d1n] net=%s reuse=%d fail=%d driver=%s ncells=%d nhint=%d\n", ctx->nameOf(ni),
+                     int(nd.is_reuse), nd.fail_count,
+                     ni->driver.cell ? ctx->nameOf(ni->driver.cell) : "-", int(cells.size()), nhint);
+            for (CellInfo *c : cells) {
+                auto ith = c->attrs.find(id_hint);
+                long hint = -1; // -1 = no hint attr; -2 = present but non-numeric (unexpected)
+                if (ith != c->attrs.end())
+                    hint = ith->second.is_string ? -2 : long(ith->second.as_int64());
+                auto ito = c->attrs.find(id_orig);
+                log_info("[d1c] net=%s cell=%s type=%s hint=%ld frozen=%d bel=%s orig=%s\n",
+                         ctx->nameOf(ni), ctx->nameOf(c), c->type.c_str(ctx), hint,
+                         int(c->attrs.count(id_frozen)),
+                         c->bel != BelId() ? ctx->nameOfBel(c->bel) : "-",
+                         (ito != c->attrs.end() && ito->second.is_string) ? ito->second.c_str() : "-");
+            }
+        }
+        log_info("[d1] DUMP END reason=%s\n", reason);
+    }
 
     void update_congestion()
     {
@@ -1282,6 +1412,27 @@ struct Router2
                 log_info("[SPLIT_DUMP_OVERUSE] %d overused wires: SITEWIRE=%d INT=%d, "
                          "%d involve a FRESH net\n", overused_wires, nsite, nint, nfresh);
             }
+        }
+        // D1 Phase-0 trace (see knob comment near d1_trace): once the overused set is
+        // small enough to be "the plateau", record its identity every iteration so
+        // churn-vs-capacity is computable offline, and snapshot periodically.
+        if (d1_trace && overused_wires > 0 && overused_wires <= d1_trace_maxw) {
+            d1_band_iters++;
+            for (auto &wire : flat_wires) {
+                if (int(wire.bound_nets.size()) <= 1)
+                    continue;
+                d1_wire_iters[wire.w]++;
+                std::string ns;
+                for (auto &b : wire.bound_nets) {
+                    d1_net_udatas.insert(b.first);
+                    ns += std::string(ns.empty() ? "" : ",") + ctx->nameOf(nets_by_udata.at(b.first)) +
+                          (nets.at(b.first).is_reuse ? "|r" : "|F");
+                }
+                log_info("[d1w] iter=%d wire=%s x=%d y=%d nets=%s\n", d1_iter,
+                         ctx->nameOfWire(wire.w), wire.x, wire.y, ns.c_str());
+            }
+            if (d1_dump_every > 0 && (d1_band_iters % d1_dump_every) == 0)
+                d1_dump("periodic");
         }
         // Fuzzy boundaries livelock breaker (docs/126): a fresh net (e.g. a moved hint
         // cell's deferred net) and a reused net can BOTH structurally need one wire
@@ -1777,6 +1928,7 @@ struct Router2
         bool last_bind_ok = false;
         log_info("Running main router loop...\n");
         do {
+            d1_iter = iter; // D1 Phase-0: expose the loop iteration to update_congestion's trace
             ctx->sorted_shuffle(route_queue);
 
             if (timing_driven && (int(route_queue.size()) > (int(nets_by_udata.size()) / 50))) {
@@ -1829,6 +1981,16 @@ struct Router2
             log_info("    iter=%d wires=%d overused=%d overuse=%d archfail=%s\n", iter, total_wire_use, overused_wires,
                      total_overuse, overused_wires > 0 ? "NA" : std::to_string(arch_fail).c_str());
             ++iter;
+            // D1 Phase-0: bounded diagnostic abort. Without this the loop never gives up
+            // on a persistent overuse plateau (docs/126: 150+ iters, no exit) — the limit
+            // makes a failing-build experiment deterministic and cheap. Off unless set.
+            if (d1_iter_limit > 0 && iter > d1_iter_limit && !failed_nets.empty()) {
+                if (d1_trace)
+                    d1_dump("iter-limit");
+                log_error("[d1] SPLIT_ROUTER_ITER_LIMIT=%d reached with overused=%d overuse=%d — "
+                          "diagnostic abort\n",
+                          d1_iter_limit, overused_wires, total_overuse);
+            }
             if (curr_cong_weight < 1e9)
                 curr_cong_weight += cfg.curr_cong_mult;
         } while (!failed_nets.empty());
