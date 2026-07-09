@@ -106,7 +106,10 @@ void Arch::parseXdc(std::istream &in)
             log_error("targets other than 'get_ports' or 'get_nets' are not supported (on line %d)\n", lineno);
         if (split.size() < 2)
             log_error("failed to parse target (on line %d)\n", lineno);
-        IdString netname = id(split.at(1));
+        // strip {braces}/"quotes" like get_cells does; without this a target
+        // written [get_ports {clk}] looked up a net literally named '{clk}',
+        // silently matched nothing, and the constraint was dropped
+        IdString netname = id(strip_quotes(split.at(1)));
         NetInfo *maybe_net = getNetByAlias(netname);
         if (maybe_net != nullptr)
             tgt_nets.push_back(maybe_net);
@@ -170,6 +173,9 @@ void Arch::parseXdc(std::istream &in)
             if (!got_period)
                 log_error("found create_clock without period (on line %d)", lineno);
             std::vector<NetInfo *> dest = get_nets(arguments.at(cursor));
+            if (dest.empty())
+                log_warning("create_clock target '%s' matched no nets -- constraint dropped (on line %d)\n",
+                            arguments.at(cursor).c_str(), lineno);
             for (auto n : dest) {
                 n->clkconstr = std::unique_ptr<ClockConstraint>(new ClockConstraint);
                 n->clkconstr->period = getDelayFromNS(period);
