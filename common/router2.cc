@@ -175,6 +175,17 @@ struct Router2
     int d1_band_iters = 0;             // iterations spent inside the traced band
     std::map<WireId, int> d1_wire_iters; // wire -> #iterations seen overused (in band)
     std::set<int> d1_net_udatas;       // cumulative contesting nets (udata), in band
+    // Starvation-mode contention (the post-docs/134 aes_gen h2+reuse failure signature:
+    // fresh arcs die of entrance starvation on the FIRST iteration, before any overuse
+    // plateau forms). Every demand_yield call is one starvation event: the starved sink
+    // wire, the requesting net, and the reuse nets ripped for it.
+    struct D1Yield
+    {
+        WireId dw;
+        int net;
+        std::vector<int> owners;
+    };
+    std::vector<D1Yield> d1_yields;
 
     // Use 'udata' for fast net lookups and indexing
     std::vector<NetInfo *> nets_by_udata;
@@ -428,6 +439,18 @@ struct Router2
                 }
             }
             frontier = next;
+        }
+        // D1 Phase-0: record the starvation event (even when no owner is rippable —
+        // that is itself signal: the cone is owned by non-reuse/hard claims).
+        if (d1_trace) {
+            D1Yield ev;
+            ev.dw = dw;
+            ev.net = net->udata;
+            ev.owners.assign(owners.begin(), owners.end());
+            d1_yields.push_back(ev);
+            d1_net_udatas.insert(net->udata);
+            for (int ow : owners)
+                d1_net_udatas.insert(ow);
         }
         for (int ow : owners) {
             NetInfo *oni = nets_by_udata.at(ow);
@@ -1285,44 +1308,77 @@ struct Router2
     //   [d1p] cumulative per-wire overuse persistence over the traced band;
     //   [d1n] each net ever seen contesting (reuse flag, fail count, cell counts);
     //   [d1c] that net's cells with FUZZY_HINT depth / X_FROZEN / bel provenance.
+    // 3-level uphill entrance-cone capacity of `w` (demand_yield's cone): counts of the
+    // distinct wires reached, classified free / bound / reserved / unavailable.
+    void d1_cone(WireId w, int out[5])
+    {
+        out[0] = out[1] = out[2] = out[3] = out[4] = 0; // total free bound resv unavail
+        std::set<WireId> seen{w};
+        std::vector<WireId> frontier{w};
+        for (int depth = 0; depth < 3 && !frontier.empty(); depth++) {
+            std::vector<WireId> next;
+            for (WireId fw : frontier) {
+                for (auto uh : ctx->getPipsUphill(fw)) {
+                    WireId sw = ctx->getPipSrcWire(uh);
+                    if (seen.count(sw))
+                        continue;
+                    seen.insert(sw);
+                    next.push_back(sw);
+                    auto &swd = wire_data(sw);
+                    out[0]++;
+                    if (swd.unavailable)
+                        out[4]++;
+                    else if (!swd.bound_nets.empty())
+                        out[2]++;
+                    else if (swd.reserved_net != -1)
+                        out[3]++;
+                    else
+                        out[1]++;
+                }
+            }
+            frontier = next;
+        }
+    }
+
     void d1_dump(const char *reason)
     {
-        log_info("[d1] DUMP reason=%s iter=%d overused=%d band_iters=%d cum_wires=%d cum_nets=%d\n",
+        log_info("[d1] DUMP reason=%s iter=%d overused=%d band_iters=%d cum_wires=%d cum_nets=%d "
+                 "yield_events=%d\n",
                  reason, d1_iter, overused_wires, d1_band_iters, int(d1_wire_iters.size()),
-                 int(d1_net_udatas.size()));
+                 int(d1_net_udatas.size()), int(d1_yields.size()));
         for (auto &wire : flat_wires) {
             if (int(wire.bound_nets.size()) <= 1)
                 continue;
-            int cw_total = 0, cw_free = 0, cw_bound = 0, cw_resv = 0, cw_unavail = 0;
-            std::set<WireId> seen{wire.w};
-            std::vector<WireId> frontier{wire.w};
-            for (int depth = 0; depth < 3 && !frontier.empty(); depth++) {
-                std::vector<WireId> next;
-                for (WireId fw : frontier) {
-                    for (auto uh : ctx->getPipsUphill(fw)) {
-                        WireId sw = ctx->getPipSrcWire(uh);
-                        if (seen.count(sw))
-                            continue;
-                        seen.insert(sw);
-                        next.push_back(sw);
-                        auto &swd = wire_data(sw);
-                        cw_total++;
-                        if (swd.unavailable)
-                            cw_unavail++;
-                        else if (!swd.bound_nets.empty())
-                            cw_bound++;
-                        else if (swd.reserved_net != -1)
-                            cw_resv++;
-                        else
-                            cw_free++;
-                    }
-                }
-                frontier = next;
-            }
+            int c[5];
+            d1_cone(wire.w, c);
             log_info("[d1o] wire=%s x=%d y=%d nnets=%d cone_total=%d cone_free=%d cone_bound=%d "
                      "cone_resv=%d cone_unavail=%d\n",
-                     ctx->nameOfWire(wire.w), wire.x, wire.y, int(wire.bound_nets.size()), cw_total,
-                     cw_free, cw_bound, cw_resv, cw_unavail);
+                     ctx->nameOfWire(wire.w), wire.x, wire.y, int(wire.bound_nets.size()), c[0],
+                     c[1], c[2], c[3], c[4]);
+        }
+        // Starvation events (demand_yield calls): requesting net, starved sink, ripped
+        // owners; then per unique starved sink its CURRENT entrance-cone capacity.
+        for (auto &ev : d1_yields) {
+            auto &wd = wire_data(ev.dw);
+            std::string os;
+            for (int ow : ev.owners)
+                os += std::string(os.empty() ? "" : ",") + ctx->nameOf(nets_by_udata.at(ow));
+            log_info("[d1y] sink=%s x=%d y=%d net=%s nowners=%d owners=%s\n", ctx->nameOfWire(ev.dw),
+                     wd.x, wd.y, ctx->nameOf(nets_by_udata.at(ev.net)), int(ev.owners.size()),
+                     os.empty() ? "-" : os.c_str());
+        }
+        {
+            std::set<WireId> sinks;
+            for (auto &ev : d1_yields)
+                sinks.insert(ev.dw);
+            for (WireId s : sinks) {
+                auto &wd = wire_data(s);
+                int c[5];
+                d1_cone(s, c);
+                log_info("[d1s] sink=%s x=%d y=%d cone_total=%d cone_free=%d cone_bound=%d "
+                         "cone_resv=%d cone_unavail=%d\n",
+                         ctx->nameOfWire(s), wd.x, wd.y, c[0], c[1], c[2], c[3], c[4]);
+            }
         }
         for (auto &kv : d1_wire_iters) {
             auto &wd = wire_data(kv.first);
