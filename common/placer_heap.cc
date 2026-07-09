@@ -375,11 +375,11 @@ class HeAPPlacer
 
     // Fuzzy boundaries STATIC FRICTION (shortshift docs/126): still-stuck hinted cells
     // (locked at their cached BEL) -> cached location. A cell leaves this map exactly
-    // once, when its B2B pull exceeds SPIKE_FUZZY_BREAKAWAY (default 0.5) — then it
+    // once, when its B2B pull exceeds SPLIT_FUZZY_BREAKAWAY (default 0.5) — then it
     // places completely freely. Cells still here at the end never moved (reuse kept).
     std::unordered_map<CellInfo *, Loc> fuzzy_stuck;
     double fuzzy_breakaway = [] {
-        const char *p = getenv("SPIKE_FUZZY_BREAKAWAY");
+        const char *p = getenv("SPLIT_FUZZY_BREAKAWAY");
         return p ? atof(p) : 0.5;
     }();
 
@@ -581,7 +581,7 @@ class HeAPPlacer
                     // STATIC FRICTION (docs/126, owner spec): the hinted cell STAYS
                     // bound+locked at its cached BEL — a stationary object the rest of
                     // the placement settles around — until the netlist pull on it
-                    // exceeds SPIKE_FUZZY_BREAKAWAY (checked per iteration in
+                    // exceeds SPLIT_FUZZY_BREAKAWAY (checked per iteration in
                     // fuzzy_breakaway_check). Once it breaks, it unbinds and places
                     // COMPLETELY freely (no residual anchor; one-way latch, like
                     // static -> kinetic friction). Cells that never break keep their

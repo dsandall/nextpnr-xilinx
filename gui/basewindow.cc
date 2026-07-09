@@ -192,8 +192,8 @@ void BaseMainWindow::createMenusAndBars()
     connect(actionExecutePy, &QAction::triggered, this, &BaseMainWindow::execute_python);
 
     // Split-flow bind stages, only when a prep script is provided via env
-    // (tools/view_bind_live.sh sets SPIKE_GUI_PREP to the generated hook runner).
-    if (getenv("SPIKE_GUI_PREP")) {
+    // (tools/view_bind_live.sh sets SPLIT_GUI_PREP to the generated hook runner).
+    if (getenv("SPLIT_GUI_PREP")) {
         actionBindPrep = new QAction("Lock Gens", this);
         actionBindPrep->setIcon(QIcon(":/icons/resources/lock_gens.png"));
         actionBindPrep->setStatusTip("Bind stage: run the split-flow lock hooks (after Pack, before Place)");
@@ -446,7 +446,7 @@ void BaseMainWindow::saveMovie()
 }
 void BaseMainWindow::runBindPrep()
 {
-    const char *prep = getenv("SPIKE_GUI_PREP");
+    const char *prep = getenv("SPLIT_GUI_PREP");
     if (!prep)
         return;
     log("Running bind prep: %s\n", prep);

@@ -122,7 +122,7 @@ class BaseMainWindow : public QMainWindow
     QAction *actionPlace;
     QAction *actionRoute;
 
-    // Split-flow bind stages (created only when SPIKE_GUI_PREP is set — see
+    // Split-flow bind stages (created only when SPLIT_GUI_PREP is set — see
     // tools/view_bind_live.sh): run the bind lock hooks / the whole bind chain.
     QAction *actionBindPrep = nullptr;
     QAction *actionRunBind = nullptr;

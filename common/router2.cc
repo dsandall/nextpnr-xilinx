@@ -117,12 +117,12 @@ struct Router2
     Router2(Context *ctx, const Router2Cfg &cfg) : ctx(ctx), cfg(cfg)
     {
         // docs/96: REUSE_NET yield penalty, tunable so cached routing seeds without forcing.
-        if (const char *p = getenv("SPIKE_REUSE_PENALTY"))
+        if (const char *p = getenv("SPLIT_REUSE_PENALTY"))
             reuse_penalty = float(atof(p));
         // Livelock breaker (see update_congestion): on for fuzzy-hop binds, or forced
-        // via SPIKE_REUSE_LIVELOCK_BREAK for plain reuse binds that hit the same class.
-        livelock_break = getenv("SPIKE_REUSE_LIVELOCK_BREAK") != nullptr ||
-                         getenv("SPIKE_BIND_FUZZY_HOPS") != nullptr;
+        // via SPLIT_REUSE_LIVELOCK_BREAK for plain reuse binds that hit the same class.
+        livelock_break = getenv("SPLIT_REUSE_LIVELOCK_BREAK") != nullptr ||
+                         getenv("SPLIT_BIND_FUZZY_HOPS") != nullptr;
     }
 
     float reuse_penalty = 3.0f;   // 8x deadlocked dense-CPU reuse; 3x = seed-not-force default
@@ -132,10 +132,10 @@ struct Router2
     int livelock_rounds = 0;      // firings since overuse last hit 0 (round 2+ rips fresh too)
     std::vector<WireId> livelock_prev; // the overused wire set being compared across iters
     int livelock_maxw = [] {           // gate: only watch for stagnation below this overuse
-        const char *p = getenv("SPIKE_REUSE_LIVELOCK_MAXW");
+        const char *p = getenv("SPLIT_REUSE_LIVELOCK_MAXW");
         return p ? atoi(p) : 64;       // aes_gen cascaded into a STAGNANT 28-wire set (>8)
     }();
-    int _overuse_seen = 0;        // SPIKE_DUMP_OVERUSE: iters with overuse seen, to dump once
+    int _overuse_seen = 0;        // SPLIT_DUMP_OVERUSE: iters with overuse seen, to dump once
 
     // Use 'udata' for fast net lookups and indexing
     std::vector<NetInfo *> nets_by_udata;
@@ -303,7 +303,7 @@ struct Router2
 
         DeterministicRNG rng;
 
-        // SPIKE_REUSE_DIAG counters: where do reused arcs go — pre-bound OK,
+        // SPLIT_REUSE_DIAG counters: where do reused arcs go — pre-bound OK,
         // backwards-merge into the seeded tree, or full forward A* (and how big)?
         long dg_nets = 0, dg_arcs_ok = 0, dg_arcs_ripped = 0, dg_bwd_merge = 0;
         long dg_astar_arcs = 0, dg_astar_iters = 0, dg_boom_logged = 0;
@@ -452,7 +452,7 @@ struct Router2
         // some OTHER net already uses, so the cached routing SEEDS the design but the router
         // is free to deviate under contention. Too stiff (8x) deadlocks dense CPUs whose
         // reused const+signal routing collide on LUT-input site wires (docs/96) -- neither
-        // side wins. SPIKE_REUSE_PENALTY tunes it (default 3x: seeded but not forced). 1.0
+        // side wins. SPLIT_REUSE_PENALTY tunes it (default 3x: seeded but not forced). 1.0
         // disables the yield entirely (pure PathFinder negotiation on the seeded routing).
         if (nd.is_reuse) {
             size_t others = wd.bound_nets.size() - (wd.bound_nets.count(net->udata) ? 1 : 0);
@@ -918,7 +918,7 @@ struct Router2
         // because there is not route, rather than just because the toexplore
         // heuristic is incorrect.
         bool must_drain_queue = !is_bb;
-        // SPIKE_REUSE_DIAG: per-rejection-reason counters for this arc's A*.
+        // SPLIT_REUSE_DIAG: per-rejection-reason counters for this arc's A*.
         long rj_bb = 0, rj_pip = 0, rj_unavail = 0, rj_reserved = 0, rj_ownpip = 0, rj_ttw = 0;
         while (!t.queue.empty() && (must_drain_queue || iter < toexplore)) {
             auto curr = t.queue.top();
@@ -997,9 +997,9 @@ struct Router2
             }
         }
         t.dg_astar_iters += iter;
-        // SPIKE_REUSE_DIAG: name the exploding arcs (first few per thread) — which
+        // SPLIT_REUSE_DIAG: name the exploding arcs (first few per thread) — which
         // net class pays the huge A*s, and between which wires.
-        static const bool dg_on = getenv("SPIKE_REUSE_DIAG") != nullptr;
+        static const bool dg_on = getenv("SPLIT_REUSE_DIAG") != nullptr;
         if (dg_on && iter > 20000 && t.dg_boom_logged < 8) {
             t.dg_boom_logged++;
             log_info("[reuse-diag] BOOM net=%s arc=%d iters=%d explored=%d src=%s dst=%s reuse=%d "
@@ -1098,11 +1098,11 @@ struct Router2
         t.dg_nets++;
         t.dg_arcs_ripped += long(t.route_arcs.size());
         t.dg_arcs_ok += long(net->users.size()) - long(t.route_arcs.size());
-        // SPIKE_REUSE_DIAG: for the first few RIPPED arcs of reuse nets, walk the
+        // SPLIT_REUSE_DIAG: for the first few RIPPED arcs of reuse nets, walk the
         // bound chain again and log WHERE it stopped (the missing-link wire class):
         // is the seed failing at the source-side site hop, a sink-side hop, or a
         // multi-bound wire? This decides what getNetRoutingLocs should also keep.
-        static const bool dg_on2 = getenv("SPIKE_REUSE_DIAG") != nullptr;
+        static const bool dg_on2 = getenv("SPLIT_REUSE_DIAG") != nullptr;
         if (dg_on2 && nets.at(net->udata).is_reuse && !t.route_arcs.empty() &&
             t.dg_chain_logged < 12) {
             t.dg_chain_logged++;
@@ -1251,11 +1251,11 @@ struct Router2
                     failed_nets.insert(bound.first);
             }
         }
-        // One-shot diagnostic (SPIKE_DUMP_OVERUSE=1, docs/96): once overuse is small+stable,
+        // One-shot diagnostic (SPLIT_DUMP_OVERUSE=1, docs/96): once overuse is small+stable,
         // categorise the overused wires (SITEWIRE vs INT) + their contending nets + reuse
         // flags, so split-flow reuse contention is visible. Prints once then disables.
         static bool _dumped = false;
-        if (!_dumped && overused_wires > 0 && getenv("SPIKE_DUMP_OVERUSE")) {
+        if (!_dumped && overused_wires > 0 && getenv("SPLIT_DUMP_OVERUSE")) {
             if (++_overuse_seen > 40) {
                 _dumped = true;
                 int nsite = 0, nint = 0, nfresh = 0, shown = 0;
@@ -1279,7 +1279,7 @@ struct Router2
                         ++shown;
                     }
                 }
-                log_info("[SPIKE_DUMP_OVERUSE] %d overused wires: SITEWIRE=%d INT=%d, "
+                log_info("[SPLIT_DUMP_OVERUSE] %d overused wires: SITEWIRE=%d INT=%d, "
                          "%d involve a FRESH net\n", overused_wires, nsite, nint, nfresh);
             }
         }
@@ -1559,10 +1559,10 @@ struct Router2
 
     void router_thread(ThreadContext &t)
     {
-        // SPIKE_REUSE_DIAG: one-line running account of where arcs go (pre-bound OK /
+        // SPLIT_REUSE_DIAG: one-line running account of where arcs go (pre-bound OK /
         // backwards-merge / forward A* + its total explored iters) — the reuse-stitch
         // fast path vs the per-arc A* explosion are indistinguishable in the normal log.
-        static const bool diag = getenv("SPIKE_REUSE_DIAG") != nullptr;
+        static const bool diag = getenv("SPLIT_REUSE_DIAG") != nullptr;
         for (auto n : t.route_nets) {
             bool result = route_net(t, n, true);
             if (!result)
@@ -1856,10 +1856,10 @@ struct Router2
         // still be produced when we skip it. On the reuse path this is the big win: without
         // the reuse-commit above, router1 re-routes the preserved reuse arcs (frozen riscv:
         // 3380 arcs / 20.37s); with it the bind is clean and router1 is skippable.
-        //   SPIKE_FINAL_CHECK env: unset/auto/0 = skip router1 when the arch bind is clean,
+        //   SPLIT_FINAL_CHECK env: unset/auto/0 = skip router1 when the arch bind is clean,
         //   else run it; always/1 = legacy (always full router1); verify/2 = clean bind runs
         //   checkRoutedDesign() instead of the full router1.
-        const char *fc_env = getenv("SPIKE_FINAL_CHECK");
+        const char *fc_env = getenv("SPLIT_FINAL_CHECK");
         std::string fc = fc_env ? fc_env : "";
         int final_check = 0; // auto
         if (fc == "1" || fc == "always")

@@ -391,11 +391,11 @@ void DesignWidget::updateTree()
         getTreeByElementType(ElementType::NET)->updateElements(nets);
     }
 
-    // Auto-highlight cells by hierarchy prefix: SPIKE_GUI_HIGHLIGHT="<prefix>:<group 0-7>[,...]"
+    // Auto-highlight cells by hierarchy prefix: SPLIT_GUI_HIGHLIGHT="<prefix>:<group 0-7>[,...]"
     // (e.g. "$flatten\u_genA.:0,$flatten\u_genB.:1"). Split-flow viewer aid — colors each
     // gen's cells without hand-selecting hundreds of tree items; reapplied after every task
     // so the coloring survives pack/place/route.
-    if (const char *spec = getenv("SPIKE_GUI_HIGHLIGHT")) {
+    if (const char *spec = getenv("SPLIT_GUI_HIGHLIGHT")) {
         QList<TreeModel::Item *> group_items[8];
         std::vector<std::pair<std::string, int>> prefixes;
         std::stringstream ss(spec);

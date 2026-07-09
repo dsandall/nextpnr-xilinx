@@ -583,11 +583,11 @@ void FPGAViewWidget::renderLines(void)
         rendererData_->gfxHovered.last_render++;
 
         // Render highlighted.
-        // Split-flow region view (SPIKE_GUI_REGION_BOX): frame each highlight group's
-        // bounding box in the group's color — with SPIKE_GUI_HIGHLIGHT coloring a gen
+        // Split-flow region view (SPLIT_GUI_REGION_BOX): frame each highlight group's
+        // bounding box in the group's color — with SPLIT_GUI_HIGHLIGHT coloring a gen
         // per group, the frame is the gen's placed footprint (the same box the bind's
         // confinement derives from the frozen BELs).
-        const bool regionBoxes = getenv("SPIKE_GUI_REGION_BOX") != nullptr;
+        const bool regionBoxes = getenv("SPLIT_GUI_REGION_BOX") != nullptr;
         for (int i = 0; i < 8; i++) {
             rendererData_->gfxHighlighted[i].clear();
             PickQuadTree::BoundingBox bbGroup;

@@ -111,7 +111,7 @@ struct Router1
     int arcs_without_ripup = 0;
     bool ripup_flag;
 
-    // SPIKE_REUSE_DIAG (docs/101 task #2): setup() arc-preservation accounting.
+    // SPLIT_REUSE_DIAG (docs/101 task #2): setup() arc-preservation accounting.
     long spk_preserved = 0, spk_q_sink_unbound = 0, spk_q_chain_break = 0, spk_q_samples = 0;
 
     Router1(Context *ctx, const Router1Cfg &cfg) : ctx(ctx), cfg(cfg) {}
@@ -403,12 +403,12 @@ struct Router1
 
                 dst_to_arc[dst_wire] = arc;
 
-                // SPIKE_REUSE_DIAG (docs/101 task #2): why does the post-router2 router1
+                // SPLIT_REUSE_DIAG (docs/101 task #2): why does the post-router2 router1
                 // check re-route this arc instead of preserving it? Two failure modes —
                 // the sink wire isn't bound at all, or the sink→source chain breaks at
                 // some intermediate wire (log its class). Preserved arcs cost ~nothing;
                 // the goal is to make router2's handoff leave chains router1 can trace.
-                static const bool spk_diag = getenv("SPIKE_REUSE_DIAG") != nullptr;
+                static const bool spk_diag = getenv("SPLIT_REUSE_DIAG") != nullptr;
                 if (net_info->wires.count(dst_wire) == 0) {
                     if (spk_diag) {
                         ++spk_q_sink_unbound;
@@ -467,7 +467,7 @@ struct Router1
                 ctx->unbindWire(it);
             }
         }
-        if (getenv("SPIKE_REUSE_DIAG") != nullptr) {
+        if (getenv("SPLIT_REUSE_DIAG") != nullptr) {
             long total = spk_preserved + spk_q_sink_unbound + spk_q_chain_break;
             log_info("[r1-diag] setup: %ld arcs | preserved=%ld (%.1f%%) "
                      "queued: sink-unbound=%ld chain-break=%ld\n",
