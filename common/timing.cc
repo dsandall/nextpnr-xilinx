@@ -21,6 +21,7 @@
 #include "timing.h"
 #include <algorithm>
 #include <boost/range/adaptor/reversed.hpp>
+#include <cmath>
 #include <deque>
 #include <map>
 #include <unordered_map>
@@ -98,6 +99,9 @@ struct Timing
     DelayFrequency *slack_histogram;
     NetCriticalityMap *net_crit;
     IdString async_clock;
+    // true when the user passed an explicit --freq (> 0): that target then
+    // overrides netlist clock constraints for every domain (split-flow D6)
+    bool user_freq;
 
     struct TimingData
     {
@@ -115,7 +119,7 @@ struct Timing
            DelayFrequency *slack_histogram = nullptr, NetCriticalityMap *net_crit = nullptr)
             : ctx(ctx), net_delays(net_delays), update(update), min_slack(1.0e12 / ctx->setting<float>("target_freq")),
               crit_path(crit_path), slack_histogram(slack_histogram), net_crit(net_crit),
-              async_clock(ctx->id("$async$"))
+              async_clock(ctx->id("$async$")), user_freq(ctx->setting<bool>("user_freq", false))
     {
     }
 
@@ -344,7 +348,9 @@ struct Timing
                             } else {
                                 period = clk_period / 2;
                             }
-                            if (clksig != async_clock) {
+                            // An explicit --freq overrides netlist clock constraints
+                            // (user_freq; the default period above already is --freq)
+                            if (clksig != async_clock && !user_freq) {
                                 if (ctx->nets.at(clksig)->clkconstr) {
                                     if (edge == startdomain.first.edge) {
                                         // same edge
@@ -511,7 +517,8 @@ struct Timing
                                 } else {
                                     period = clk_period / 2;
                                 }
-                                if (clksig != async_clock) {
+                                // An explicit --freq overrides netlist clock constraints
+                                if (clksig != async_clock && !user_freq) {
                                     if (ctx->nets.at(clksig)->clkconstr) {
                                         if (edge == startdomain.first.edge) {
                                             // same edge
@@ -918,8 +925,16 @@ void timing_analysis(Context *ctx, bool print_histogram, bool print_fmax, bool p
             const auto &clock_name = clock.first.str(ctx);
             const int width = max_width - clock_name.size();
             float target = ctx->setting<float>("target_freq") / 1e6;
-            if (ctx->nets.at(clock.first)->clkconstr)
-                target = 1000 / ctx->getDelayNS(ctx->nets.at(clock.first)->clkconstr->period.minDelay());
+            bool user_freq = ctx->setting<bool>("user_freq", false);
+            if (ctx->nets.at(clock.first)->clkconstr) {
+                float constr = 1000 / ctx->getDelayNS(ctx->nets.at(clock.first)->clkconstr->period.minDelay());
+                if (user_freq && std::abs(constr - target) > 0.005f)
+                    // explicit --freq overrides the netlist constraint; say so
+                    log_info("Clock '%s': --freq %.2f MHz overrides the netlist constraint of %.2f MHz\n",
+                             clock_name.c_str(), target, constr);
+                else if (!user_freq)
+                    target = constr;
+            }
 
             bool passed = target < clock_fmax[clock.first];
             if (!warn_on_failure || passed)

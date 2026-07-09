@@ -242,8 +242,13 @@ void CommandHandler::setupContext(Context *ctx)
     }
     if (vm.count("freq")) {
         auto freq = vm["freq"].as<double>();
-        if (freq > 0)
+        if (freq > 0) {
             ctx->settings[ctx->id("target_freq")] = std::to_string(freq * 1e6);
+            // An explicit --freq is the user overriding the target: it takes
+            // precedence over netlist clock constraints (create_clock) in STA
+            // and budget assignment (split-flow D6; SPLIT_BIND_FREQ rides this).
+            ctx->settings[ctx->id("user_freq")] = true;
+        }
     }
 
     if (vm.count("no-tmdriv"))
@@ -261,6 +266,8 @@ void CommandHandler::setupContext(Context *ctx)
         ctx->settings[ctx->id("slack_redist_iter")] = 0;
     if (ctx->settings.find(ctx->id("auto_freq")) == ctx->settings.end())
         ctx->settings[ctx->id("auto_freq")] = false;
+    if (ctx->settings.find(ctx->id("user_freq")) == ctx->settings.end())
+        ctx->settings[ctx->id("user_freq")] = false;
     if (ctx->settings.find(ctx->id("placer")) == ctx->settings.end())
         ctx->settings[ctx->id("placer")] = Arch::defaultPlacer;
     if (ctx->settings.find(ctx->id("router")) == ctx->settings.end())
