@@ -23,7 +23,10 @@
 #include "log.h"
 #include "nextpnr.h"
 
+#include <fstream>
 #include <streambuf>
+#include <unordered_map>
+#include <unordered_set>
 
 NEXTPNR_NAMESPACE_BEGIN
 
@@ -181,7 +184,283 @@ struct JsonFrontendImpl
     }
 };
 
-bool parse_json(std::istream &in, const std::string &filename, Context *ctx)
+// ── split-flow D2 step 1: engine-native frozen-gen splice (`--import-frozen`) ─────────
+// C++ port of the bind's Python pre-splice (toolchains/openshort/split_flow/bind/
+// combine_frozen.py, docs/93 Option 3). Each frozen gen is an already-PACKED placed+
+// routed netlist (freeze_gen.py output) — yosys cannot re-read a packed netlist
+// (docs/93 §6.2), so the splice happens on the parsed JSON tree here, BEFORE the
+// generic frontend imports the design:
+//   * the gen's internal bit ids are renumbered to fresh ids disjoint from the checker;
+//     its boundary PORT bits are mapped onto the blackbox instance's checker bits, so
+//     each boundary net is ONE net across gen+checker.
+//   * gen cells/netnames are spliced in under an "<instance>." prefix (attributes —
+//     NEXTPNR_BEL / BEL_STRENGTH / ROUTING_LOCS / X_FROZEN — carried untouched); the
+//     blackbox instance and the wrapper module defs are dropped.
+//   * const network: $PACKER_{GND,VCC}_{DRV,NET} stay CANONICAL (unprefixed, first gen
+//     wins — every gen ships its DRV at the same singleton PSEUDO BEL); later gens'
+//     const bits are pre-aliased onto the canonical combined bits and their reused
+//     ROUTING_LOCS unioned (dedup by "wt,wi" wire key).
+// Fresh-id numeric values are assigned in json11's sorted-key order (the Python assigns
+// in file order); they are invisible provided every renumbered bit carries a netname —
+// otherwise the frontend would mint a "$frontend$<bit>" net NAME from the id. The
+// splice warns loudly if that ever happens (identity-at-risk).
+// NOTE (docs/134 lesson / full-D2 headroom): this step splices the same JSON facts the
+// Python did — packer state that never reaches the JSON (constr_parent macro bindings)
+// is equally absent from both paths. A later D2 step can extend the frozen JSON with
+// those facts and consume them HERE, natively, without another pipeline stage.
+
+static bool attr_true(const Json &val)
+{
+    if (val.is_null())
+        return false;
+    if (val.is_number())
+        return val.int_value() != 0;
+    // yosys writes attribute ints as bit strings, e.g. "000...001"
+    return val.string_value().find('1') != std::string::npos;
+}
+
+static Json::object obj_items(const Json &j) { return j.is_object() ? j.object_items() : Json::object{}; }
+
+static bool is_const_drv(const std::string &n) { return n == "$PACKER_GND_DRV" || n == "$PACKER_VCC_DRV"; }
+static bool is_const_net(const std::string &n) { return n == "$PACKER_GND_NET" || n == "$PACKER_VCC_NET"; }
+
+// "wt,wi" key of one ROUTING_LOCS entry (everything before the second comma)
+static std::string routing_wire_key(const std::string &entry)
+{
+    size_t c1 = entry.find(',');
+    if (c1 == std::string::npos)
+        return entry;
+    size_t c2 = entry.find(',', c1 + 1);
+    return entry.substr(0, c2 == std::string::npos ? std::string::npos : c2);
+}
+
+static Json splice_frozen_gens(const Json &modroot, const std::vector<std::string> &specs)
+{
+    Json::object mods = modroot.object_items();
+    // the checker top = the module with a truthy (* top *) attribute (yosys synth sets it)
+    std::string topname;
+    for (auto &kv : mods) {
+        const Json &attrs = kv.second["attributes"];
+        if (attr_true(attrs["top"]) && !attr_true(attrs["blackbox"])) {
+            if (!topname.empty())
+                log_error("[import-frozen] multiple (* top *) modules: '%s' and '%s'\n", topname.c_str(),
+                          kv.first.c_str());
+            topname = kv.first;
+        }
+    }
+    if (topname.empty())
+        log_error("[import-frozen] no module with a (* top *) attribute in the --json input\n");
+    Json::object top = obj_items(mods.at(topname));
+    Json::object topcells = obj_items(top["cells"]);
+    Json::object topnets = obj_items(top["netnames"]);
+
+    // next fresh bit id = 1 + max int bit anywhere in the checker top
+    int next_bit = 0;
+    auto scan_bits = [&next_bit](const Json &bits) {
+        for (const auto &b : bits.array_items())
+            if (b.is_number() && b.int_value() > next_bit)
+                next_bit = b.int_value();
+    };
+    for (auto &c : topcells)
+        for (auto &conn : obj_items(c.second["connections"]))
+            scan_bits(conn.second);
+    for (auto &nv : topnets)
+        scan_bits(nv.second["bits"]);
+    for (auto &pv : obj_items(top["ports"]))
+        scan_bits(pv.second["bits"]);
+    next_bit += 1;
+
+    for (const auto &spec : specs) {
+        // spec = "<wrapper_top>:<frozen_gen.json>"
+        size_t colon = spec.find(':');
+        if (colon == std::string::npos)
+            log_error("[import-frozen] bad spec '%s' (want <wrapper_top>:<frozen.json>)\n", spec.c_str());
+        std::string wrapper = spec.substr(0, colon), path = spec.substr(colon + 1);
+
+        std::ifstream fin(path);
+        if (!fin)
+            log_error("[import-frozen] failed to open '%s'\n", path.c_str());
+        std::string ftext((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
+        std::string ferror;
+        Json froot = Json::parse(ftext, ferror, JsonParse::COMMENTS);
+        if (froot.is_null())
+            log_error("[import-frozen] failed to parse '%s': %s\n", path.c_str(), ferror.c_str());
+        const Json::object &fmods = froot["modules"].object_items();
+        if (fmods.size() != 1)
+            log_error("[import-frozen] '%s': expected exactly 1 module, got %d\n", path.c_str(), int(fmods.size()));
+        const Json &fm = fmods.begin()->second;
+        Json::object fm_cells = obj_items(fm["cells"]);
+        Json::object fm_nets = obj_items(fm["netnames"]);
+        Json::object fm_ports = obj_items(fm["ports"]);
+
+        // bits of the gen that carry a netname (fresh-id-leak guard, see header comment)
+        std::unordered_set<int> fm_named;
+        for (auto &nv : fm_nets)
+            for (const auto &b : nv.second["bits"].array_items())
+                if (b.is_number())
+                    fm_named.insert(b.int_value());
+
+        // every blackbox instance of this wrapper in the checker top (usually one)
+        std::vector<std::pair<std::string, Json>> insts;
+        for (auto &kv : topcells)
+            if (kv.second["type"].string_value() == wrapper)
+                insts.emplace_back(kv.first, kv.second);
+        if (insts.empty())
+            log_error("[import-frozen] no blackbox instance of '%s' in '%s'\n", wrapper.c_str(), topname.c_str());
+
+        for (auto &inst : insts) {
+            const std::string &inst_name = inst.first;
+            Json::object conns = obj_items(inst.second["connections"]);
+            // 1. gen-bit -> combined-bit map. Boundary port bits share the instance's
+            //    checker bits (Json: may be an int bit OR a "0"/"1" const string).
+            std::unordered_map<int, Json> bmap;
+            for (auto &pkv : fm_ports) {
+                const std::string &pname = pkv.first;
+                if (!conns.count(pname))
+                    log_error("[import-frozen] %s.%s: gen port not driven by instance\n", inst_name.c_str(),
+                              pname.c_str());
+                const Json::array &cb = conns.at(pname).array_items();
+                const Json::array &gb = pkv.second["bits"].array_items();
+                if (cb.size() != gb.size())
+                    log_error("[import-frozen] %s.%s: width %d vs instance %d\n", inst_name.c_str(), pname.c_str(),
+                              int(gb.size()), int(cb.size()));
+                for (size_t i = 0; i < gb.size(); i++)
+                    if (gb[i].is_number())
+                        bmap[gb[i].int_value()] = cb[i];
+            }
+            // multi-gen const unification: pre-seed so every gen's $PACKER_*_NET collapses
+            // onto the canonical (first gen's) combined bit
+            for (const char *nn : {"$PACKER_GND_NET", "$PACKER_VCC_NET"}) {
+                if (fm_nets.count(nn) && topnets.count(nn)) {
+                    const Json::array &gbits = fm_nets.at(nn)["bits"].array_items();
+                    const Json::array &cbits = topnets.at(nn)["bits"].array_items();
+                    for (size_t i = 0; i < gbits.size() && i < cbits.size(); i++)
+                        if (gbits[i].is_number())
+                            bmap[gbits[i].int_value()] = cbits[i];
+                }
+            }
+            // remaining internal gen bits -> fresh ids (numbering order differs from the
+            // Python; invisible unless a renumbered bit has no netname — warn if so)
+            int fresh_anon = 0;
+            auto remap = [&](const Json &bits_json) -> Json {
+                Json::array out;
+                for (const auto &b : bits_json.array_items()) {
+                    if (!b.is_number()) { // "0"/"1"/"x"/"z"
+                        out.push_back(b);
+                        continue;
+                    }
+                    int gb = b.int_value();
+                    auto it = bmap.find(gb);
+                    if (it == bmap.end()) {
+                        if (!fm_named.count(gb))
+                            fresh_anon++;
+                        it = bmap.emplace(gb, Json(next_bit++)).first;
+                    }
+                    out.push_back(it->second);
+                }
+                return Json(out);
+            };
+            // 2. splice cells (prefixed so genA/genB names can't collide); const drivers
+            //    stay canonical/unprefixed, first gen wins
+            const std::string pfx = inst_name + ".";
+            for (auto &ckv : fm_cells) {
+                Json::object nc = obj_items(ckv.second);
+                Json::object nconn;
+                for (auto &pc : obj_items(ckv.second["connections"]))
+                    nconn[pc.first] = remap(pc.second);
+                nc["connections"] = Json(nconn);
+                if (is_const_drv(ckv.first))
+                    topcells.emplace(ckv.first, Json(nc)); // setdefault
+                else
+                    topcells[pfx + ckv.first] = Json(nc);
+            }
+            // 3. splice netnames (ROUTING_LOCS etc. ride along); skip the gen's own pure
+            //    port nets (their bits are now checker nets that already have netnames)
+            std::unordered_set<int> portbits;
+            for (auto &pkv : fm_ports)
+                for (const auto &b : pkv.second["bits"].array_items())
+                    if (b.is_number())
+                        portbits.insert(b.int_value());
+            for (auto &nkv : fm_nets) {
+                const std::string &nn = nkv.first;
+                const Json::array &bits = nkv.second["bits"].array_items();
+                bool all_port = true;
+                for (const auto &b : bits)
+                    if (!b.is_number() || !portbits.count(b.int_value())) {
+                        all_port = false;
+                        break;
+                    }
+                if (all_port)
+                    continue;
+                if (is_const_net(nn) && topnets.count(nn)) {
+                    // union this gen's reused const ROUTING_LOCS into the canonical net
+                    // (one driving pip per wire is enough; the router's REUSE yielding
+                    // repairs any tree-vs-tree disagreement)
+                    std::string src = nkv.second["attributes"]["ROUTING_LOCS"].string_value();
+                    if (!src.empty()) {
+                        Json::object dnet = obj_items(topnets.at(nn));
+                        Json::object dattrs = obj_items(dnet["attributes"]);
+                        std::string dst =
+                                dattrs.count("ROUTING_LOCS") ? dattrs.at("ROUTING_LOCS").string_value() : "";
+                        std::unordered_set<std::string> have;
+                        std::vector<std::string> add;
+                        auto foreach_entry = [](const std::string &s, auto fn) {
+                            size_t start = 0;
+                            while (start <= s.size()) {
+                                size_t end = s.find(';', start);
+                                if (end == std::string::npos)
+                                    end = s.size();
+                                if (end > start)
+                                    fn(s.substr(start, end - start));
+                                start = end + 1;
+                            }
+                        };
+                        foreach_entry(dst, [&](const std::string &e) { have.insert(routing_wire_key(e)); });
+                        foreach_entry(src, [&](const std::string &e) {
+                            if (!have.count(routing_wire_key(e)))
+                                add.push_back(e);
+                        });
+                        if (!add.empty()) {
+                            std::string joined;
+                            for (size_t i = 0; i < add.size(); i++)
+                                joined += (i ? ";" : "") + add[i];
+                            dattrs["ROUTING_LOCS"] = Json(dst + joined + ";");
+                            dnet["attributes"] = Json(dattrs);
+                            topnets[nn] = Json(dnet);
+                        }
+                    }
+                    continue;
+                }
+                Json::object nv = obj_items(nkv.second);
+                nv["bits"] = remap(nkv.second["bits"]); // eager, like the Python setdefault
+                std::string key = is_const_net(nn) ? nn : pfx + nn;
+                topnets.emplace(key, Json(nv)); // setdefault
+            }
+            // 4. drop the blackbox instance
+            topcells.erase(inst_name);
+            if (fresh_anon)
+                log_warning("[import-frozen] %s: %d renumbered bits have NO netname — their "
+                            "$frontend$<bit> net names depend on renumbering order and may not "
+                            "match the Python combine (identity at risk)\n",
+                            inst_name.c_str(), fresh_anon);
+            log_info("[import-frozen] %s(%s): +%d cells from %s\n", inst_name.c_str(), wrapper.c_str(),
+                     int(fm_cells.size()), path.c_str());
+        }
+        // remove the now-unused wrapper module defs
+        mods.erase(wrapper);
+        mods.erase("$abstract\\" + wrapper);
+    }
+
+    top["cells"] = Json(topcells);
+    top["netnames"] = Json(topnets);
+    mods[topname] = Json(top);
+    log_info("[import-frozen] top '%s' now %d cells, %d nets\n", topname.c_str(), int(topcells.size()),
+             int(topnets.size()));
+    return Json(mods);
+}
+
+bool parse_json(std::istream &in, const std::string &filename, Context *ctx,
+                const std::vector<std::string> &import_frozen)
 {
     Json root;
     {
@@ -197,8 +476,15 @@ bool parse_json(std::istream &in, const std::string &filename, Context *ctx)
             log_error("JSON file '%s' doesn't look like a netlist (doesn't contain \"modules\" key)\n",
                       filename.c_str());
     }
+    if (!import_frozen.empty())
+        root = splice_frozen_gens(root, import_frozen);
     GenericFrontend<JsonFrontendImpl>(ctx, JsonFrontendImpl(root))();
     return true;
+}
+
+bool parse_json(std::istream &in, const std::string &filename, Context *ctx)
+{
+    return parse_json(in, filename, ctx, {});
 }
 
 NEXTPNR_NAMESPACE_END

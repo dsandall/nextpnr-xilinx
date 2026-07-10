@@ -122,6 +122,9 @@ po::options_description CommandHandler::getGeneralOptions()
 
 #endif
     general.add_options()("json", po::value<std::string>(), "JSON design file to ingest");
+    general.add_options()("import-frozen", po::value<std::vector<std::string>>()->composing(),
+                          "splice a frozen packed gen into the --json top before import: "
+                          "<wrapper_top>:<frozen_gen.json> (split-flow bind, repeatable)");
     general.add_options()("write", po::value<std::string>(), "JSON design file to write");
     general.add_options()("seed", po::value<int>(), "seed value for random number generator");
     general.add_options()("randomize-seed,r", "randomize seed value for random number generator");
@@ -311,7 +314,13 @@ int CommandHandler::executeMain(std::unique_ptr<Context> ctx)
     if (vm.count("json")) {
         std::string filename = vm["json"].as<std::string>();
         std::ifstream f(filename);
-        if (!parse_json(f, filename, ctx.get()))
+        // split-flow D2 step 1: optional engine-native frozen-gen splice (see
+        // frontend/json_frontend.cc). Batch flow only; the GUI path above keeps the
+        // plain loader (the bind never binds through the GUI).
+        std::vector<std::string> import_frozen;
+        if (vm.count("import-frozen"))
+            import_frozen = vm["import-frozen"].as<std::vector<std::string>>();
+        if (!parse_json(f, filename, ctx.get(), import_frozen))
             log_error("Loading design failed.\n");
 
         customAfterLoad(ctx.get());

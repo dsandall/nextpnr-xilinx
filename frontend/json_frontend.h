@@ -23,4 +23,10 @@ NEXTPNR_NAMESPACE_BEGIN
 
 bool parse_json(std::istream &in, const std::string &filename, Context *ctx);
 
+// split-flow D2 step 1: parse + splice frozen packed gens into the top before import.
+// Each import_frozen spec is "<wrapper_top>:<frozen_gen.json>" (freeze_gen.py output);
+// C++ equivalent of the bind's Python combine_frozen.py pre-splice (docs/93 §6.2).
+bool parse_json(std::istream &in, const std::string &filename, Context *ctx,
+                const std::vector<std::string> &import_frozen);
+
 NEXTPNR_NAMESPACE_END
