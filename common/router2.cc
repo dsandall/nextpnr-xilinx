@@ -468,6 +468,15 @@ struct Router2
                 ad.routed = false;
             nets.at(ow).is_reuse = false;
             failed_nets.insert(ow);
+            // shortshift docs/157: failed_nets is CLEARED by update_congestion() every
+            // iteration and repopulated from overused wires only — a ripped net binds no
+            // wires, is never overused, and silently fell out of the requeue: it shipped
+            // with ZERO routing while bind_and_check_all's !ad.routed early-out reported
+            // success and the clean-bind path skipped the router1 tail that would have
+            // caught it (the aes fuzzy HIL-FAIL class: st[0]/st[1] simply absent from
+            // silicon). Track rips persistently; merged back after every
+            // update_congestion() in the main loop.
+            yield_ripped.insert(ow);
         }
         if (!owners.empty()) {
             // clear reservations the ripped nets held anywhere near the sink
@@ -1299,6 +1308,9 @@ struct Router2
     int total_overuse = 0;
     std::vector<int> route_queue;
     std::set<int> failed_nets;
+    // demand_yield rips that must survive update_congestion()'s failed_nets.clear()
+    // until their nets are actually re-routed (shortshift docs/157).
+    std::set<int> yield_ripped;
 
     // D1 Phase-0: full contention snapshot (see the knob comment near d1_trace).
     // Emitted line classes (all machine-parseable, one record per line):
@@ -2018,6 +2030,13 @@ struct Router2
             do_route();
             route_queue.clear();
             update_congestion();
+            // shortshift docs/157: re-queue demand_yield rips — update_congestion() just
+            // cleared failed_nets and rebuilt it from overuse alone, which never contains
+            // a fully-unbound (ripped) net. Without this the rip is permanent silent
+            // net loss (see demand_yield).
+            for (int n : yield_ripped)
+                failed_nets.insert(n);
+            yield_ripped.clear();
 #if 0
             if (iter == 1 && ctx->debug) {
                 std::ofstream cong_map("cong_map_0.csv");
@@ -2085,6 +2104,40 @@ struct Router2
         else if (fc == "2" || fc == "verify")
             final_check = 2;
         bool bind_clean = last_bind_ok && overused_wires == 0;
+
+        // shortshift docs/157: bind_and_check_all treats !ad.routed arcs as success (a
+        // long-standing "leave it to the router1 tail" semantic), so "clean" alone must
+        // not be allowed to skip the tail: a net silently dropped mid-router2 (the
+        // demand_yield rip class) would ship with no routing at all. Rule-8 gate: count
+        // arcs whose sink wire is genuinely unbound at the arch level; any hit forces
+        // the router1 tail (which routes stragglers or hard-errors).
+        int unbound_arcs = 0;
+        for (auto net : nets_by_udata) {
+            auto &nd = nets.at(net->udata);
+            for (size_t a = 0; a < nd.arcs.size() && a < net->users.size(); a++) {
+                if (nd.arcs.at(a).routed)
+                    continue;
+                WireId dw = ctx->getNetinfoSinkWire(net, net->users.at(a));
+                if (dw != WireId() && ctx->getBoundWireNet(dw) != net) {
+                    // PAD/IOB arcs (clk/rst OUTBUF_OUT sinks) are legitimately unrouted
+                    // here — fixupRouting's route_bfs PAD pass handles them after the
+                    // router; counting them would force the router1 tail on EVERY build
+                    // and void the docs/102 clean-bind skip.
+                    std::string dwn = ctx->nameOfWire(dw);
+                    if (dwn.find("/IOB_") != std::string::npos)
+                        continue;
+                    if (unbound_arcs < 10)
+                        log_warning("unbound arc %d of net '%s' (sink %s) after router2 — "
+                                    "forcing router1 tail\n",
+                                    int(a), ctx->nameOf(net), ctx->nameOfWire(dw));
+                    unbound_arcs++;
+                }
+            }
+        }
+        if (unbound_arcs > 0) {
+            log_warning("%d unbound arc(s) survived router2; running router1 tail\n", unbound_arcs);
+            bind_clean = false;
+        }
 
         if (final_check == 1 || !bind_clean) {
             log_info("Running router1 to check that route is legal...\n");

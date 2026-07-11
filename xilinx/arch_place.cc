@@ -1046,6 +1046,25 @@ void Arch::fixupRouting()
                     continue;
                 new_connections[ports[(pip >> 4) & 0xF]].push_back(ports[pip & 0xF]);
             }
+            // shortshift docs/157: a z-position with NO permutation pips must be left
+            // untouched. The old code erased the X_ORIG_PORT physical->logical pin
+            // mapping for ALL SIX ports of BOTH LUTs whenever the TILE had any perm
+            // pip, re-stamping only the perm-pip pins below. Fresh-routed nets use
+            // perm pips; frozen/reused cached arcs do NOT (their permutation was
+            // eliminated when the gen was packed), so a fuzzy bind — the one flow
+            // mixing both in a tile — lost the reused pins' mappings, and the FASM
+            // writer (fasm.cc get_lut_init) silently emitted all-zero/garbled LUT
+            // INITs: the aes fuzzy HIL-FAIL class (and plausibly docs/142's
+            // mixed_gen_bind HIL-RED). Only ports PARTICIPATING in this z's remap
+            // are disconnected, so only those may have their mapping erased.
+            if (new_connections.empty())
+                continue;
+            std::set<IdString> touched;
+            for (auto &nc : new_connections) {
+                touched.insert(nc.first);
+                for (auto &dst : nc.second)
+                    touched.insert(dst);
+            }
             std::unordered_map<IdString, NetInfo *> orig_nets;
             std::unordered_map<IdString, std::string> orig_ports_l6, orig_ports_l5;
             for (int i = 0; i < 6; i++) {
@@ -1069,11 +1088,11 @@ void Arch::fixupRouting()
                         disconnect_port(getCtx(), lut5, dst);
                 }
             }
-            for (int i = 0; i < 6; i++) {
+            for (IdString p : touched) {
                 if (lut6)
-                    lut6->attrs.erase(id("X_ORIG_PORT_" + ports[i].str(this)));
+                    lut6->attrs.erase(id("X_ORIG_PORT_" + p.str(this)));
                 if (lut5)
-                    lut5->attrs.erase(id("X_ORIG_PORT_" + ports[i].str(this)));
+                    lut5->attrs.erase(id("X_ORIG_PORT_" + p.str(this)));
             }
             for (int i = 0; i < 6; i++) {
                 auto p = ports[i];
