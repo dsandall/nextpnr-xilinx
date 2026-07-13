@@ -190,9 +190,9 @@ struct JsonFrontendImpl
 // routed netlist (freeze_gen.py output) — yosys cannot re-read a packed netlist
 // (docs/93 §6.2), so the splice happens on the parsed JSON tree here, BEFORE the
 // generic frontend imports the design:
-//   * the gen's internal bit ids are renumbered to fresh ids disjoint from the checker;
-//     its boundary PORT bits are mapped onto the blackbox instance's checker bits, so
-//     each boundary net is ONE net across gen+checker.
+//   * the gen's internal bit ids are renumbered to fresh ids disjoint from the outside
+//     design; its boundary PORT bits are mapped onto the blackbox instance's outside bits, so
+//     each boundary net is ONE net across the gen and outside design.
 //   * gen cells/netnames are spliced in under an "<instance>." prefix (attributes —
 //     NEXTPNR_BEL / BEL_STRENGTH / ROUTING_LOCS / X_FROZEN — carried untouched); the
 //     blackbox instance and the wrapper module defs are dropped.
@@ -237,7 +237,7 @@ static std::string routing_wire_key(const std::string &entry)
 static Json splice_frozen_gens(const Json &modroot, const std::vector<std::string> &specs)
 {
     Json::object mods = modroot.object_items();
-    // the checker top = the module with a truthy (* top *) attribute (yosys synth sets it)
+    // the outside-design top = the module with a truthy (* top *) attribute (yosys sets it)
     std::string topname;
     for (auto &kv : mods) {
         const Json &attrs = kv.second["attributes"];
@@ -254,7 +254,7 @@ static Json splice_frozen_gens(const Json &modroot, const std::vector<std::strin
     Json::object topcells = obj_items(top["cells"]);
     Json::object topnets = obj_items(top["netnames"]);
 
-    // next fresh bit id = 1 + max int bit anywhere in the checker top
+    // next fresh bit id = 1 + max int bit anywhere in the outside-design top
     int next_bit = 0;
     auto scan_bits = [&next_bit](const Json &bits) {
         for (const auto &b : bits.array_items())
@@ -317,9 +317,9 @@ static Json splice_frozen_gens(const Json &modroot, const std::vector<std::strin
             const std::string &inst_name = inst.first;
             Json::object conns = obj_items(inst.second["connections"]);
             // 1. gen-bit -> combined-bit map. Boundary port bits share the instance's
-            //    checker bits (Json: may be an int bit OR a "0"/"1" const string).
+            //    outside-design bits (Json: may be an int bit OR a "0"/"1" const string).
             std::unordered_map<int, Json> bmap;
-            std::unordered_map<int, Json> aliases; // checker bit -> canonical checker bit
+            std::unordered_map<int, Json> aliases; // outside bit -> canonical outside bit
             for (auto &pkv : fm_ports) {
                 const std::string &pname = pkv.first;
                 if (!conns.count(pname))
@@ -336,9 +336,9 @@ static Json splice_frozen_gens(const Json &modroot, const std::vector<std::strin
                     int gen_bit = gb[i].int_value();
                     auto prior = bmap.find(gen_bit);
                     if (prior != bmap.end() && prior->second != cb[i]) {
-                        // One frozen bit exposed through multiple ports: the checker-side
+                        // One frozen bit exposed through multiple ports: the outside-design
                         // nets are electrically one node. Match combine_frozen.py by
-                        // canonicalizing the later checker bit onto the first mapping.
+                        // canonicalizing the later outside-design bit onto the first mapping.
                         if (cb[i].is_number())
                             aliases[cb[i].int_value()] = prior->second;
                     } else {
@@ -379,7 +379,7 @@ static Json splice_frozen_gens(const Json &modroot, const std::vector<std::strin
                     if (a != aliases.end())
                         bm.second = a->second;
                 }
-                log_info("[import-frozen] %s: unified %d checker bit(s) aliased across gen ports\n",
+                log_info("[import-frozen] %s: unified %d outside-design bit(s) aliased across gen ports\n",
                          inst_name.c_str(), int(aliases.size()));
             }
             // multi-gen const unification: pre-seed so every gen's $PACKER_*_NET collapses
@@ -429,7 +429,7 @@ static Json splice_frozen_gens(const Json &modroot, const std::vector<std::strin
                     topcells[pfx + ckv.first] = Json(nc);
             }
             // 3. splice netnames (ROUTING_LOCS etc. ride along); skip the gen's own pure
-            //    port nets (their bits are now checker nets that already have netnames)
+            //    port nets (their bits are now outside-design nets with existing netnames)
             std::unordered_set<int> portbits;
             for (auto &pkv : fm_ports)
                 for (const auto &b : pkv.second["bits"].array_items())
