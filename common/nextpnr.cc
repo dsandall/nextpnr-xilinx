@@ -644,6 +644,8 @@ int BaseCtx::bindRoutingLocsChecked(NetInfo *ni, const std::string &s)
             break;
         pos = semi + 1;
     }
+    reuse_requested_nets++;
+    reuse_requested_wires += int(entries.size());
     // Precheck before binding anything: independently-P&R'd frozen gens can land
     // on the same canonical node (xc7 wires are multi-tile nodes -- long LV/LH
     // wires cross region boundaries), so two gens' dumped arcs may claim one dst
@@ -699,6 +701,8 @@ int BaseCtx::bindRoutingLocsChecked(NetInfo *ni, const std::string &s)
     }
     if (root_dead) {
         reuse_conflict_nets++;
+        reuse_root_dropped_nets++;
+        reuse_severed_wires += int(entries.size());
         if (reuse_conflict_nets <= 10)
             log_warning("reuse locs conflict: net '%s' source wire is owned by net '%s'; "
                         "dropping ALL of its reused routing (will route fresh)\n",
@@ -707,6 +711,7 @@ int BaseCtx::bindRoutingLocsChecked(NetInfo *ni, const std::string &s)
     }
     if (!dead.empty()) {
         reuse_conflict_nets++;
+        reuse_severed_wires += int(dead.size());
         if (reuse_conflict_nets <= 10)
             log_warning("reuse locs conflict: net '%s' overlaps net '%s'; severing %d of %d "
                         "arcs (colliding branch reroutes; rest of the tree is kept)\n",
@@ -717,6 +722,8 @@ int BaseCtx::bindRoutingLocsChecked(NetInfo *ni, const std::string &s)
     // wires, so a colliding frozen arc must reroute AROUND rather than overuse.
     // Harmless for a contention-free faithful round-trip (the router never rips).
     ni->attrs[id("REUSE_NET")] = Property(1);
+    reuse_bound_nets++;
+    reuse_bound_wires += int(entries.size() - dead.size());
     for (const auto &e : entries) {
         if (dead.count({e.wt, e.wi}))
             continue;

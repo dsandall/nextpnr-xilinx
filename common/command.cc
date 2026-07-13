@@ -124,7 +124,7 @@ po::options_description CommandHandler::getGeneralOptions()
     general.add_options()("json", po::value<std::string>(), "JSON design file to ingest");
     general.add_options()("import-frozen", po::value<std::vector<std::string>>()->composing(),
                           "splice a frozen packed gen into the --json top before import: "
-                          "<wrapper_top>:<frozen_gen.json> (split-flow bind, repeatable)");
+                          "<wrapper_top>:<instance>:<frozen_gen.json> (split-flow bind, repeatable)");
     general.add_options()("write", po::value<std::string>(), "JSON design file to write");
     general.add_options()("seed", po::value<int>(), "seed value for random number generator");
     general.add_options()("randomize-seed,r", "randomize seed value for random number generator");

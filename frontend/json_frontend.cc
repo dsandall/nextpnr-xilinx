@@ -271,11 +271,14 @@ static Json splice_frozen_gens(const Json &modroot, const std::vector<std::strin
     next_bit += 1;
 
     for (const auto &spec : specs) {
-        // spec = "<wrapper_top>:<frozen_gen.json>"
-        size_t colon = spec.find(':');
-        if (colon == std::string::npos)
-            log_error("[import-frozen] bad spec '%s' (want <wrapper_top>:<frozen.json>)\n", spec.c_str());
-        std::string wrapper = spec.substr(0, colon), path = spec.substr(colon + 1);
+        // spec = "<wrapper_top>:<instance>:<frozen_gen.json>". Instance identity is
+        // explicit: partitions may legitimately share one wrapper type but carry different
+        // placed/routed artifacts.
+        size_t colon1 = spec.find(':'), colon2 = colon1 == std::string::npos ? colon1 : spec.find(':', colon1 + 1);
+        if (colon1 == std::string::npos || colon2 == std::string::npos)
+            log_error("[import-frozen] bad spec '%s' (want <wrapper_top>:<instance>:<frozen.json>)\n", spec.c_str());
+        std::string wrapper = spec.substr(0, colon1), requested_inst = spec.substr(colon1 + 1, colon2 - colon1 - 1),
+                    path = spec.substr(colon2 + 1);
 
         std::ifstream fin(path);
         if (!fin)
@@ -300,13 +303,15 @@ static Json splice_frozen_gens(const Json &modroot, const std::vector<std::strin
                 if (b.is_number())
                     fm_named.insert(b.int_value());
 
-        // every blackbox instance of this wrapper in the checker top (usually one)
+        // The one explicitly addressed blackbox instance.
         std::vector<std::pair<std::string, Json>> insts;
-        for (auto &kv : topcells)
-            if (kv.second["type"].string_value() == wrapper)
-                insts.emplace_back(kv.first, kv.second);
-        if (insts.empty())
-            log_error("[import-frozen] no blackbox instance of '%s' in '%s'\n", wrapper.c_str(), topname.c_str());
+        auto requested = topcells.find(requested_inst);
+        if (requested == topcells.end())
+            log_error("[import-frozen] no instance '%s' in '%s'\n", requested_inst.c_str(), topname.c_str());
+        if (requested->second["type"].string_value() != wrapper)
+            log_error("[import-frozen] instance '%s' has type '%s', expected '%s'\n", requested_inst.c_str(),
+                      requested->second["type"].string_value().c_str(), wrapper.c_str());
+        insts.emplace_back(requested->first, requested->second);
 
         for (auto &inst : insts) {
             const std::string &inst_name = inst.first;
@@ -314,6 +319,7 @@ static Json splice_frozen_gens(const Json &modroot, const std::vector<std::strin
             // 1. gen-bit -> combined-bit map. Boundary port bits share the instance's
             //    checker bits (Json: may be an int bit OR a "0"/"1" const string).
             std::unordered_map<int, Json> bmap;
+            std::unordered_map<int, Json> aliases; // checker bit -> canonical checker bit
             for (auto &pkv : fm_ports) {
                 const std::string &pname = pkv.first;
                 if (!conns.count(pname))
@@ -324,9 +330,57 @@ static Json splice_frozen_gens(const Json &modroot, const std::vector<std::strin
                 if (cb.size() != gb.size())
                     log_error("[import-frozen] %s.%s: width %d vs instance %d\n", inst_name.c_str(), pname.c_str(),
                               int(gb.size()), int(cb.size()));
-                for (size_t i = 0; i < gb.size(); i++)
-                    if (gb[i].is_number())
-                        bmap[gb[i].int_value()] = cb[i];
+                for (size_t i = 0; i < gb.size(); i++) {
+                    if (!gb[i].is_number())
+                        continue;
+                    int gen_bit = gb[i].int_value();
+                    auto prior = bmap.find(gen_bit);
+                    if (prior != bmap.end() && prior->second != cb[i]) {
+                        // One frozen bit exposed through multiple ports: the checker-side
+                        // nets are electrically one node. Match combine_frozen.py by
+                        // canonicalizing the later checker bit onto the first mapping.
+                        if (cb[i].is_number())
+                            aliases[cb[i].int_value()] = prior->second;
+                    } else {
+                        bmap[gen_bit] = cb[i];
+                    }
+                }
+            }
+            if (!aliases.empty()) {
+                auto sub_aliases = [&aliases](const Json &bits) -> Json {
+                    Json::array out;
+                    for (const auto &b : bits.array_items()) {
+                        auto a = b.is_number() ? aliases.find(b.int_value()) : aliases.end();
+                        out.push_back(a == aliases.end() ? b : a->second);
+                    }
+                    return Json(out);
+                };
+                for (auto &tc : topcells) {
+                    Json::object cell = obj_items(tc.second), rewritten;
+                    for (auto &pc : obj_items(tc.second["connections"]))
+                        rewritten[pc.first] = sub_aliases(pc.second);
+                    cell["connections"] = Json(rewritten);
+                    tc.second = Json(cell);
+                }
+                for (auto &tn : topnets) {
+                    Json::object net = obj_items(tn.second);
+                    net["bits"] = sub_aliases(tn.second["bits"]);
+                    tn.second = Json(net);
+                }
+                Json::object topports = obj_items(top["ports"]);
+                for (auto &tp : topports) {
+                    Json::object port = obj_items(tp.second);
+                    port["bits"] = sub_aliases(tp.second["bits"]);
+                    tp.second = Json(port);
+                }
+                top["ports"] = Json(topports);
+                for (auto &bm : bmap) {
+                    auto a = bm.second.is_number() ? aliases.find(bm.second.int_value()) : aliases.end();
+                    if (a != aliases.end())
+                        bm.second = a->second;
+                }
+                log_info("[import-frozen] %s: unified %d checker bit(s) aliased across gen ports\n",
+                         inst_name.c_str(), int(aliases.size()));
             }
             // multi-gen const unification: pre-seed so every gen's $PACKER_*_NET collapses
             // onto the canonical (first gen's) combined bit

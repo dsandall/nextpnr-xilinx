@@ -851,6 +851,11 @@ struct BaseCtx
     // nets after placement settles. `locs` is the 5-field "wt,wi,pt,pi,strength;" form.
     int bindRoutingLocsChecked(NetInfo *ni, const std::string &locs);
     int reuse_conflict_nets = 0; // shared warn-limit counter for the above
+    // Always-on accounting for split-flow routing replay. Hooks and load-time imports both
+    // use bindRoutingLocsChecked, so these are the complete pre-router denominators.
+    int reuse_requested_nets = 0, reuse_requested_wires = 0;
+    int reuse_bound_nets = 0, reuse_bound_wires = 0;
+    int reuse_severed_wires = 0, reuse_root_dropped_nets = 0;
 #endif
 };
 

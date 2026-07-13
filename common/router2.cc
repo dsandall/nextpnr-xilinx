@@ -54,6 +54,8 @@ struct Router2
         WireId sink_wire;
         ArcBounds bb;
         bool routed = false;
+        bool replay_seeded = false;
+        bool replay_kept = false;
         float arc_crit = 0;
     };
 
@@ -70,6 +72,7 @@ struct Router2
         float max_crit = 0;
         int fail_count = 0;
         bool is_reuse = false;   // split-flow option (c): yields to fresh nets (docs/47)
+        bool was_reuse = false;  // immutable accounting bit; is_reuse clears on full-net yield
     };
 
     struct WireScore
@@ -210,6 +213,7 @@ struct Router2
             nets_by_udata.at(i) = ni;
             nets.at(i).arcs.resize(ni->users.size());
             nets.at(i).is_reuse = ni->attrs.count(ctx->id("REUSE_NET")) != 0;
+            nets.at(i).was_reuse = nets.at(i).is_reuse;
 
             // Start net bounding box at overall min/max
             nets.at(i).bb.x0 = std::numeric_limits<int>::max();
@@ -576,6 +580,20 @@ struct Router2
             cursor = ctx->getPipSrcWire(uh);
         }
         return (cursor == src_wire);
+    }
+
+    void account_initial_replay()
+    {
+        for (NetInfo *net : nets_by_udata) {
+            auto &nd = nets.at(net->udata);
+            if (!nd.was_reuse)
+                continue;
+            for (size_t a = 0; a < nd.arcs.size(); a++) {
+                bool seeded = check_arc_routing(net, a);
+                nd.arcs.at(a).replay_seeded = seeded;
+                nd.arcs.at(a).replay_kept = seeded;
+            }
+        }
     }
 
     // Returns true if a wire contains no source ports or driving pips
@@ -1157,6 +1175,10 @@ struct Router2
                     nets.at(net->udata).arcs.at(i).routed = true;
                 continue;
             }
+            // Once an originally seeded arc needs routing work, it is no longer an intact
+            // replay even if a later iteration happens to reconstruct the same path.
+            if (nets.at(net->udata).was_reuse)
+                nets.at(net->udata).arcs.at(i).replay_kept = false;
             auto &usr = net->users.at(i);
             WireId dst_wire = ctx->getNetinfoSinkWire(net, usr);
             // Case of arcs that were pre-routed strongly (e.g. clocks)
@@ -1931,6 +1953,13 @@ struct Router2
         auto rstart = std::chrono::high_resolution_clock::now();
         setup_nets();
         setup_wires();
+        account_initial_replay();
+#ifdef ARCH_XILINX
+        log_info("[routing-replay] load requested_nets=%d requested_wires=%d bound_nets=%d "
+                 "bound_wires=%d severed_wires=%d root_dropped_nets=%d\n",
+                 ctx->reuse_requested_nets, ctx->reuse_requested_wires, ctx->reuse_bound_nets,
+                 ctx->reuse_bound_wires, ctx->reuse_severed_wires, ctx->reuse_root_dropped_nets);
+#endif
         find_all_reserved_wires();
         // Fuzzy boundaries PRE-FLIGHT STARVATION SWEEP (docs/126 fast path): an
         // entrance-starved arc otherwise burns a full A* drain (~2M nodes, seconds of
@@ -2139,7 +2168,8 @@ struct Router2
             bind_clean = false;
         }
 
-        if (final_check == 1 || !bind_clean) {
+        bool ran_router1 = final_check == 1 || !bind_clean;
+        if (ran_router1) {
             log_info("Running router1 to check that route is legal...\n");
             router1(ctx, Router1Cfg(ctx));
         } else {
@@ -2156,6 +2186,25 @@ struct Router2
             timing_analysis(ctx, true /* slack_histogram */, true /* print_fmax */, true /* print_path */,
                             true /* warn_on_failure */);
         }
+
+        int replay_nets = 0, replay_arcs = 0, seeded_arcs = 0, kept_arcs = 0, yielded_nets = 0;
+        for (NetInfo *net : nets_by_udata) {
+            auto &nd = nets.at(net->udata);
+            if (!nd.was_reuse)
+                continue;
+            replay_nets++;
+            yielded_nets += !nd.is_reuse;
+            replay_arcs += int(nd.arcs.size());
+            for (auto &ad : nd.arcs) {
+                seeded_arcs += ad.replay_seeded;
+                kept_arcs += ad.replay_kept;
+            }
+        }
+        log_info("[routing-replay] route replay_nets=%d replay_arcs=%d seeded_arcs=%d "
+                 "kept_arcs=%d rerouted_arcs=%d yielded_nets=%d iterations=%d "
+                 "unbound_arcs=%d router1_tail=%d\n",
+                 replay_nets, replay_arcs, seeded_arcs, kept_arcs, seeded_arcs - kept_arcs,
+                 yielded_nets, iter - 1, unbound_arcs, int(ran_router1));
     }
 };
 } // namespace
