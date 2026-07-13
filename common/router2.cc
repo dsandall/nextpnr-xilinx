@@ -1946,6 +1946,37 @@ struct Router2
 #endif
     }
 
+    // Machine-readable replay checkpoint.  The successful route summary used to be emitted
+    // only after router2 and its router1 tail completed, so a plateau, diagnostic abort, or
+    // externally terminated collection had no replay accounting at all.  Periodic progress
+    // records make the last coherent state recoverable from the route log; NA is deliberately
+    // textual so consumers cannot mistake a phase that was not reached for a real zero.
+    void log_replay_route_summary(const char *phase, const char *status, int completed_iterations,
+                                  int unbound_arcs = -1, int router1_tail = -1)
+    {
+        int replay_nets = 0, replay_arcs = 0, seeded_arcs = 0, kept_arcs = 0, yielded_nets = 0;
+        for (NetInfo *net : nets_by_udata) {
+            auto &nd = nets.at(net->udata);
+            if (!nd.was_reuse)
+                continue;
+            replay_nets++;
+            yielded_nets += !nd.is_reuse;
+            replay_arcs += int(nd.arcs.size());
+            for (auto &ad : nd.arcs) {
+                seeded_arcs += ad.replay_seeded;
+                kept_arcs += ad.replay_kept;
+            }
+        }
+        std::string unbound = unbound_arcs < 0 ? "NA" : std::to_string(unbound_arcs);
+        std::string tail = router1_tail < 0 ? "NA" : std::to_string(router1_tail);
+        log_info("[routing-replay] %s status=%s replay_nets=%d replay_arcs=%d seeded_arcs=%d "
+                 "kept_arcs=%d rerouted_arcs=%d yielded_nets=%d iterations=%d "
+                 "unbound_arcs=%s router1_tail=%s\n",
+                 phase, status, replay_nets, replay_arcs, seeded_arcs, kept_arcs,
+                 seeded_arcs - kept_arcs, yielded_nets, completed_iterations,
+                 unbound.c_str(), tail.c_str());
+    }
+
     void operator()()
     {
         log_info("Running router2...\n");
@@ -2084,6 +2115,8 @@ struct Router2
                 route_queue.push_back(cn);
             log_info("    iter=%d wires=%d overused=%d overuse=%d archfail=%s\n", iter, total_wire_use, overused_wires,
                      total_overuse, overused_wires > 0 ? "NA" : std::to_string(arch_fail).c_str());
+            if (iter == 1 || (iter % 10) == 0)
+                log_replay_route_summary("progress", "running", iter);
             ++iter;
             // D1 Phase-0: bounded diagnostic abort. Without this the loop never gives up
             // on a persistent overuse plateau (docs/126: 150+ iters, no exit) — the limit
@@ -2091,6 +2124,7 @@ struct Router2
             if (d1_iter_limit > 0 && iter > d1_iter_limit && !failed_nets.empty()) {
                 if (d1_trace)
                     d1_dump("iter-limit");
+                log_replay_route_summary("route", "failed", iter - 1);
                 log_error("[d1] SPLIT_ROUTER_ITER_LIMIT=%d reached with overused=%d overuse=%d — "
                           "diagnostic abort\n",
                           d1_iter_limit, overused_wires, total_overuse);
@@ -2187,24 +2221,7 @@ struct Router2
                             true /* warn_on_failure */);
         }
 
-        int replay_nets = 0, replay_arcs = 0, seeded_arcs = 0, kept_arcs = 0, yielded_nets = 0;
-        for (NetInfo *net : nets_by_udata) {
-            auto &nd = nets.at(net->udata);
-            if (!nd.was_reuse)
-                continue;
-            replay_nets++;
-            yielded_nets += !nd.is_reuse;
-            replay_arcs += int(nd.arcs.size());
-            for (auto &ad : nd.arcs) {
-                seeded_arcs += ad.replay_seeded;
-                kept_arcs += ad.replay_kept;
-            }
-        }
-        log_info("[routing-replay] route replay_nets=%d replay_arcs=%d seeded_arcs=%d "
-                 "kept_arcs=%d rerouted_arcs=%d yielded_nets=%d iterations=%d "
-                 "unbound_arcs=%d router1_tail=%d\n",
-                 replay_nets, replay_arcs, seeded_arcs, kept_arcs, seeded_arcs - kept_arcs,
-                 yielded_nets, iter - 1, unbound_arcs, int(ran_router1));
+        log_replay_route_summary("route", "complete", iter - 1, unbound_arcs, int(ran_router1));
     }
 };
 } // namespace

@@ -494,8 +494,8 @@ static Json splice_frozen_gens(const Json &modroot, const std::vector<std::strin
             topcells.erase(inst_name);
             if (fresh_anon)
                 log_warning("[import-frozen] %s: %d renumbered bits have NO netname — their "
-                            "$frontend$<bit> net names depend on renumbering order and may not "
-                            "match the Python combine (identity at risk)\n",
+                            "$frontend$<bit> net names depend on native import order "
+                            "(identity stability risk)\n",
                             inst_name.c_str(), fresh_anon);
             log_info("[import-frozen] %s(%s): +%d cells from %s\n", inst_name.c_str(), wrapper.c_str(),
                      int(fm_cells.size()), path.c_str());
