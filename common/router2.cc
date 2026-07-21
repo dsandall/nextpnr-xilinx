@@ -33,6 +33,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <queue>
 #include <set>
@@ -174,6 +175,24 @@ struct Router2
         const char *p = getenv("SPLIT_ROUTER_ITER_LIMIT");
         return p ? atoi(p) : -1;
     }();
+    // Stall abort (docs/212, owner 2026-07-21) — DEFAULT ON, unlike the diagnostics
+    // above: the main loop otherwise never terminates on a persistent overuse plateau
+    // (observed: fuzzy n4 flat at overused=6 for 150+ iters even with the livelock
+    // breaker firing — rips re-route straight back into the same structural conflict).
+    // A failing axis combination must fail IN nextpnr, bounded, with a diagnostic —
+    // never grind forever. Any improvement in (overused wires, then total overuse)
+    // resets the counter, so slow-but-monotonic convergence is untouched; the abort
+    // only fires after SPLIT_ROUTER_STALL_ITERS consecutive iterations with zero
+    // improvement while overuse persists (congestion weight rising the whole time).
+    // 0 or negative disables. Passing builds are bit-identical: detection only reads
+    // the stats; the abort path is unreachable for any route that ever completed.
+    int stall_iter_limit = [] {
+        const char *p = getenv("SPLIT_ROUTER_STALL_ITERS");
+        return p ? atoi(p) : 75;
+    }();
+    int stall_best_wires = std::numeric_limits<int>::max();
+    int stall_best_overuse = std::numeric_limits<int>::max();
+    int stall_iters = 0; // consecutive iterations without improvement
     int d1_iter = 0;                   // current main-loop iteration (set each iter)
     int d1_band_iters = 0;             // iterations spent inside the traced band
     std::map<WireId, int> d1_wire_iters; // wire -> #iterations seen overused (in band)
@@ -2118,6 +2137,44 @@ struct Router2
             if (iter == 1 || (iter % 10) == 0)
                 log_replay_route_summary("progress", "running", iter);
             ++iter;
+            // Stall abort (docs/212): terminate a plateau the pressure loop cannot win
+            // (e.g. overused wires held by frozen imports, which congestion can never
+            // evict). Fail like any router failure — loudly, with the contested wires
+            // and their nets named — instead of iterating forever.
+            if (overused_wires > 0) {
+                if (overused_wires < stall_best_wires ||
+                    (overused_wires == stall_best_wires && total_overuse < stall_best_overuse)) {
+                    stall_best_wires = overused_wires;
+                    stall_best_overuse = total_overuse;
+                    stall_iters = 0;
+                } else {
+                    ++stall_iters;
+                }
+                if (stall_iter_limit > 0 && stall_iters >= stall_iter_limit) {
+                    for (auto &wire : flat_wires) {
+                        if (int(wire.bound_nets.size()) <= 1)
+                            continue;
+                        std::string ns;
+                        for (auto &b : wire.bound_nets)
+                            ns += std::string(ns.empty() ? "" : ",") +
+                                  ctx->nameOf(nets_by_udata.at(b.first)) +
+                                  (nets.at(b.first).is_reuse ? "|r" : "|F");
+                        log_info("[stall] wire=%s x=%d y=%d nets=%s\n", ctx->nameOfWire(wire.w),
+                                 wire.x, wire.y, ns.c_str());
+                    }
+                    if (d1_trace)
+                        d1_dump("stall-abort");
+                    log_replay_route_summary("route", "failed", iter);
+                    log_error("router stalled: no overuse improvement for %d iterations "
+                              "(overused=%d overuse=%d, best seen overused=%d overuse=%d) — "
+                              "aborting; the contested wires are listed above "
+                              "(SPLIT_ROUTER_STALL_ITERS tunes, 0 disables)\n",
+                              stall_iters, overused_wires, total_overuse, stall_best_wires,
+                              stall_best_overuse);
+                }
+            } else {
+                stall_iters = 0;
+            }
             // D1 Phase-0: bounded diagnostic abort. Without this the loop never gives up
             // on a persistent overuse plateau (docs/126: 150+ iters, no exit) — the limit
             // makes a failing-build experiment deterministic and cheap. Off unless set.
