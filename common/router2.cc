@@ -1278,6 +1278,26 @@ struct Router2
                         for (auto bn : wire_data(dw).bound_nets)
                             log_info("  [fail-diag] sink wire bound by net %s\n",
                                      ctx->nameOf(nets_by_udata.at(bn.first)));
+                        // docs/216: walk the bound chain sink->root with names — is the
+                        // cached tree complete, and where would a ride from the source
+                        // have to enter it?
+                        {
+                            WireId cur = dw;
+                            int guard = 0;
+                            while (guard++ < 40) {
+                                auto &cwd2 = wire_data(cur);
+                                if (!cwd2.bound_nets.count(net->udata)) {
+                                    log_info("  [fail-diag] CHAIN break at %s (unbound)\n", ctx->nameOfWire(cur));
+                                    break;
+                                }
+                                PipId bp = cwd2.bound_nets.at(net->udata).second;
+                                log_info("  [fail-diag] CHAIN %s visited=%d pip=%s\n", ctx->nameOfWire(cur),
+                                         int(cwd2.visit.visited), bp == PipId() ? "ROOT" : ctx->nameOfPip(bp));
+                                if (bp == PipId())
+                                    break;
+                                cur = ctx->getPipSrcWire(bp);
+                            }
+                        }
                         for (auto uh : ctx->getPipsUphill(dw)) {
                             NetInfo *own = ctx->getBoundPipNet(uh);
                             log_info("  [fail-diag] uphill pip %s avail=%d bound=%s\n", ctx->nameOfPip(uh),
