@@ -1393,31 +1393,27 @@ struct Arch : BaseCtx
     // Returns the wires unbound.
     int pruneNetSourceDisconnected(NetInfo *net)
     {
-        if (net->wires.empty() || net->driver.cell == nullptr)
+        if (net->wires.empty())
             return 0;
-        BelId src_bel = net->driver.cell->bel;
-        if (src_bel == BelId())
-            return 0;
-        IdString port = net->driver.port;
-        auto ppin = net->driver.cell->pins.find(port);
-        if (ppin != net->driver.cell->pins.end())
-            port = ppin->second;
-        WireId root = getBelPinWire(src_bel, port);
-        if (root == WireId())
-            return 0;
+        // liveness = reachable from a bound ROOT (pip == PipId()): INT-only reuse trees
+        // are legitimately rooted at their first INT wire (sentinel root), NOT at the
+        // driver's site pin — driver-pin reachability would nuke every healthy tree.
+        // What this prunes is orphan fragments: a branch whose top wire's driving-pip
+        // SOURCE is unbound (severing cut the chain mid-way), e.g. the sink-side
+        // DX-gap stub that hard-owns the sink site's entrance pip.
+        std::map<WireId, std::vector<WireId>> kids; // src wire -> wires its pip drives
         std::set<WireId> live;
         std::vector<WireId> work;
-        if (net->wires.count(root)) {
-            live.insert(root);
-            work.push_back(root);
-        }
-        // root unbound -> live stays empty and the WHOLE tree is a dangling branch
-        std::map<WireId, std::vector<WireId>> kids; // src wire -> wires its pip drives
         for (auto &it : net->wires) {
-            if (it.second.pip == PipId())
+            if (it.second.pip == PipId()) {
+                live.insert(it.first); // root
+                work.push_back(it.first);
                 continue;
+            }
             kids[getPipSrcWire(it.second.pip)].push_back(it.first);
         }
+        if (live.empty())
+            return 0; // rootless net (nothing to anchor liveness on) — leave it alone
         while (!work.empty()) {
             WireId w = work.back();
             work.pop_back();
