@@ -1074,7 +1074,13 @@ struct Router2
                     rj_reserved++;
                     continue;
                 }
-                if (nwd.bound_nets.count(net->udata) && nwd.bound_nets.at(net->udata).second != dh) {
+                // fuzzy boundaries (shortshift docs/216): a ROOT-bound own wire (pip ==
+                // PipId(), the INT-only reuse sentinel) used to reject EVERY real pip
+                // here, walling the net's own cached chain off from its fresh source-side
+                // arc — the moved-FF A*-drain class. Entering one's own root via any pip
+                // is exactly how a fresh arc is meant to adopt the cached tree.
+                if (nwd.bound_nets.count(net->udata) && nwd.bound_nets.at(net->udata).second != dh &&
+                    nwd.bound_nets.at(net->udata).second != PipId()) {
                     rj_ownpip++;
                     continue;
                 }
