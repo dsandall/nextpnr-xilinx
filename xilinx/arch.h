@@ -1238,13 +1238,37 @@ struct Arch : BaseCtx
                 }
             }
         }
+        // SINK CONE (docs/216): FF sinks have TWO site hops (tile CLBLM_L_DX -> site
+        // DX bypass -> DFFMUX_OUT bel pin) where LUT sinks have one — dropping DX as
+        // an "intermediate mux hop" reloads every FF-D chain with a one-wire gap, so
+        // check_arc_routing fails and the arc re-routes (harmless when the fabric has
+        // slack; an A*-drain under fuzzy moved-FF pressure). The bypass is per-eighth
+        // and single-net — no permutation contention (the docs/96 collision argument
+        // does not apply) — so keep the site chain UPHILL of each sink pin, stopping
+        // at the first non-SITEWIRE (the tile fabric). LUT sinks stop immediately
+        // (their pin's parent is the tile IMUX), so docs/96 behaviour is unchanged.
+        std::unordered_set<WireId> kept_sink;
+        for (WireId sw : sink_wires) {
+            WireId cur = sw;
+            while (true) {
+                auto wit = net->wires.find(cur);
+                if (wit == net->wires.end() || wit->second.pip == PipId())
+                    break;
+                WireId up = getPipSrcWire(wit->second.pip);
+                if (getWireName(up).str(this).compare(0, 9, "SITEWIRE/") != 0)
+                    break;
+                if (!kept_sink.insert(up).second)
+                    break;
+                cur = up;
+            }
+        }
         std::string s;
         for (auto &it : net->wires) {
             WireId w = it.first;
             PipId p = it.second.pip;
             if (p != PipId() && getWireName(w).str(this).compare(0, 9, "SITEWIRE/") == 0 &&
-                !sink_wires.count(w) && !kept_src.count(w))
-                continue;   // drop intermediate mux site hop; keep sink pin + INT + root + src cone
+                !sink_wires.count(w) && !kept_src.count(w) && !kept_sink.count(w))
+                continue;   // drop intermediate mux site hop; keep sink pin/cone + INT + root + src cone
             // Root/site-source wire (p == PipId()) emits the explicit
             // ROUTING_LOC_ROOT_SENTINEL for (pt,pi); a real pip emits its own
             // {tile,index}. Bytes are identical to the old implicit form (-1,-1).
