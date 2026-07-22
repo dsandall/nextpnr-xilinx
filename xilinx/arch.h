@@ -1382,6 +1382,61 @@ struct Arch : BaseCtx
         return removed;
     }
 
+    // fuzzy boundaries (shortshift docs/216): a net REBOUND by the fuzzy_rebind hook can
+    // be severed by a LATER net's collision-severing rebind, cutting its upstream and
+    // leaving a sink-terminated dangling branch that pruneNetDeadBranches keeps (its
+    // leaf IS a legit sink pin). The stale branch's pips then hard-own the sink site's
+    // entrances and the fresh arc A*-drains ("net has N bound wires; src bound: 0").
+    // Unbind every bound wire NOT reachable from the net's CURRENT driver pin wire over
+    // bound pips. NEVER call this on const nets: their faithful trees legitimately hold
+    // many site-source roots (A6-VCC ties) that are not pip-reachable from the driver.
+    // Returns the wires unbound.
+    int pruneNetSourceDisconnected(NetInfo *net)
+    {
+        if (net->wires.empty() || net->driver.cell == nullptr)
+            return 0;
+        BelId src_bel = net->driver.cell->bel;
+        if (src_bel == BelId())
+            return 0;
+        IdString port = net->driver.port;
+        auto ppin = net->driver.cell->pins.find(port);
+        if (ppin != net->driver.cell->pins.end())
+            port = ppin->second;
+        WireId root = getBelPinWire(src_bel, port);
+        if (root == WireId())
+            return 0;
+        std::set<WireId> live;
+        std::vector<WireId> work;
+        if (net->wires.count(root)) {
+            live.insert(root);
+            work.push_back(root);
+        }
+        // root unbound -> live stays empty and the WHOLE tree is a dangling branch
+        std::map<WireId, std::vector<WireId>> kids; // src wire -> wires its pip drives
+        for (auto &it : net->wires) {
+            if (it.second.pip == PipId())
+                continue;
+            kids[getPipSrcWire(it.second.pip)].push_back(it.first);
+        }
+        while (!work.empty()) {
+            WireId w = work.back();
+            work.pop_back();
+            auto kit = kids.find(w);
+            if (kit == kids.end())
+                continue;
+            for (WireId k : kit->second)
+                if (live.insert(k).second)
+                    work.push_back(k);
+        }
+        std::vector<WireId> dead;
+        for (auto &it : net->wires)
+            if (!live.count(it.first))
+                dead.push_back(it.first);
+        for (WireId w : dead)
+            unbindWire(w);
+        return int(dead.size());
+    }
+
     void bindNetRoutingLocs(NetInfo *net, std::string s, PlaceStrength strength)
     {
         // Mark this as a REUSED net so router2 makes it YIELD to fresh nets under
