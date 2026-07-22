@@ -646,6 +646,38 @@ int BaseCtx::bindRoutingLocsChecked(NetInfo *ni, const std::string &s)
     }
     reuse_requested_nets++;
     reuse_requested_wires += int(entries.size());
+    // docs/216 stale-root gate: a SINGLE-root cached tree must be rooted at the CURRENT
+    // source pin wire. The fuzzy placer can move cells that never carried FUZZY_HINT
+    // (cluster escorts released alongside a hinted partner), so the hook's
+    // hinted-cells-stayed gate passes vacuously and would rebind a tree rooted at the
+    // driver's OLD site — a one-way stale wall that monopolizes its sinks' only
+    // entrances (the moved-FF A*-drain class, seam_drain slice-grain repro). Multi-root
+    // trees (const pseudo nets' site-source roots) are exempt.
+    {
+        int nroots = 0;
+        const LocEntry *root = nullptr;
+        for (const auto &e : entries)
+            if (e.pt < 0) {
+                nroots++;
+                root = &e;
+            }
+        if (nroots == 1 && ni->driver.cell != nullptr && ni->driver.cell->bel != BelId()) {
+            IdString port = ni->driver.port;
+            auto pit = ni->driver.cell->pins.find(port);
+            if (pit != ni->driver.cell->pins.end())
+                port = pit->second;
+            WireId sw = getCtx()->getBelPinWire(ni->driver.cell->bel, port);
+            if (sw != WireId() && (sw.tile != root->wt || sw.index != root->wi)) {
+                reuse_conflict_nets++;
+                reuse_root_dropped_nets++;
+                if (reuse_conflict_nets <= 10)
+                    log_warning("reuse locs stale root: net '%s' cached root is not the current "
+                                "source pin (driver moved); dropping ALL reused routing (fresh)\n",
+                                nameOf(ni));
+                return 0; // no REUSE_NET mark -- plain fresh net
+            }
+        }
+    }
     // Precheck before binding anything: independently-P&R'd frozen gens can land
     // on the same canonical node (xc7 wires are multi-tile nodes -- long LV/LH
     // wires cross region boundaries), so two gens' dumped arcs may claim one dst
