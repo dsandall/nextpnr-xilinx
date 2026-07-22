@@ -93,6 +93,8 @@ void arch_wrap_python()
                   pass_through<int>, addr_and_unwrap<NetInfo>>::def_wrap(ctx_cls, "pruneNetDeadBranches");
     fn_wrapper_1a<Context, decltype(&Context::pruneNetSourceDisconnected), &Context::pruneNetSourceDisconnected,
                   pass_through<int>, addr_and_unwrap<NetInfo>>::def_wrap(ctx_cls, "pruneNetSourceDisconnected");
+    fn_wrapper_0a<Context, decltype(&Context::validateReuseRoots), &Context::validateReuseRoots,
+                  pass_through<int>>::def_wrap(ctx_cls, "validateReuseRoots");
 
     WRAP_RANGE(Bel, conv_to_str<BelId>);
     WRAP_RANGE(Wire, conv_to_str<WireId>);

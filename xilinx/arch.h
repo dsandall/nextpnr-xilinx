@@ -1457,6 +1457,48 @@ struct Arch : BaseCtx
         return int(dead.size());
     }
 
+    // docs/216 post-placement reuse validation: rip any REUSE net whose SINGLE bound
+    // root is no longer the current source pin wire. The load path's stale-root gate
+    // runs pre-placement and cannot see drivers the fuzzy placer later moves (cluster
+    // escorts that never carried FUZZY_HINT); their rebound trees become one-way stale
+    // walls that monopolize their sinks' only entrances (the A*-drain class). Multi-
+    // root (const pseudo) nets are exempt. Returns nets ripped to fresh.
+    int validateReuseRoots()
+    {
+        int ripped = 0;
+        for (auto &np : nets) {
+            NetInfo *ni = np.second.get();
+            if (ni->wires.empty() || !ni->attrs.count(id("REUSE_NET")))
+                continue;
+            if (ni->driver.cell == nullptr || ni->driver.cell->bel == BelId())
+                continue;
+            int nroots = 0;
+            WireId root;
+            for (auto &w : ni->wires)
+                if (w.second.pip == PipId()) {
+                    nroots++;
+                    root = w.first;
+                }
+            if (nroots != 1)
+                continue;
+            IdString port = ni->driver.port;
+            auto pit = ni->driver.cell->pins.find(port);
+            if (pit != ni->driver.cell->pins.end())
+                port = pit->second;
+            WireId sw = getBelPinWire(ni->driver.cell->bel, port);
+            if (sw == WireId() || sw == root)
+                continue;
+            std::vector<WireId> all;
+            for (auto &w : ni->wires)
+                all.push_back(w.first);
+            for (WireId w : all)
+                unbindWire(w);
+            ni->attrs.erase(id("REUSE_NET"));
+            ripped++;
+        }
+        return ripped;
+    }
+
     void bindNetRoutingLocs(NetInfo *net, std::string s, PlaceStrength strength)
     {
         // Mark this as a REUSED net so router2 makes it YIELD to fresh nets under
