@@ -319,7 +319,10 @@ class HeAPPlacer
             placer1_cfg.hpwl_scale_x = cfg.hpwl_scale_x;
             placer1_cfg.hpwl_scale_y = cfg.hpwl_scale_y;
             placer1_cfg.netShareWeight = cfg.netShareWeight;
-            placer1_refine(ctx, placer1_cfg);
+            // Propagate refine failure — swallowing it reported "place successful"
+            // over a dead SA pass (and, pre-RAII, a still-held ctx lock).
+            if (!placer1_refine(ctx, placer1_cfg))
+                return false;
         } else {
             log_info("Skipping SA refinement (placerHeap/saRefine = false).\n");
         }

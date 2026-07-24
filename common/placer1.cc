@@ -59,6 +59,18 @@ template <> struct hash<std::pair<NEXTPNR_NAMESPACE_PREFIX IdString, std::size_t
 
 NEXTPNR_NAMESPACE_BEGIN
 
+// A log_error inside place() throws past ctx->lock(); without RAII the worker thread
+// returns to its event loop still owning ctx->mutex and the GUI main thread deadlocks
+// in updateTree (seen live on a bind: SA refine died in legalisation, GUI froze).
+struct CtxLockGuard
+{
+    Context *ctx;
+    explicit CtxLockGuard(Context *c) : ctx(c) { ctx->lock(); }
+    ~CtxLockGuard() { ctx->unlock(); }
+    CtxLockGuard(const CtxLockGuard &) = delete;
+    CtxLockGuard &operator=(const CtxLockGuard &) = delete;
+};
+
 class SAPlacer
 {
   private:
@@ -151,7 +163,7 @@ class SAPlacer
     bool place(bool refine = false)
     {
         log_break();
-        ctx->lock();
+        CtxLockGuard lock_ctx(ctx);
 
         size_t placed_cells = 0;
         std::vector<CellInfo *> autoplaced;
@@ -430,7 +442,6 @@ class SAPlacer
                 log_error("constraint satisfaction check failed for cell '%s' at Bel '%s'\n", cell.first.c_str(ctx),
                           ctx->getBelName(cell.second->bel).c_str(ctx));
         timing_analysis(ctx);
-        ctx->unlock();
         return true;
     }
 
