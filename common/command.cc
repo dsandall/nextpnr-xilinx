@@ -296,7 +296,12 @@ int CommandHandler::executeMain(std::unique_ptr<Context> ctx)
             if (vm.count("json")) {
                 std::string filename = vm["json"].as<std::string>();
                 std::ifstream f(filename);
-                if (!parse_json(f, filename, w.getContext()))
+                // split-flow: the GUI is a live bind viewer (view_bind_live.sh) — honor
+                // --import-frozen exactly like the batch path below.
+                std::vector<std::string> import_frozen;
+                if (vm.count("import-frozen"))
+                    import_frozen = vm["import-frozen"].as<std::vector<std::string>>();
+                if (!parse_json(f, filename, w.getContext(), import_frozen))
                     log_error("Loading design failed.\n");
                 customAfterLoad(w.getContext());
                 w.notifyChangeContext();
@@ -315,8 +320,8 @@ int CommandHandler::executeMain(std::unique_ptr<Context> ctx)
         std::string filename = vm["json"].as<std::string>();
         std::ifstream f(filename);
         // split-flow D2 step 1: optional engine-native frozen-gen splice (see
-        // frontend/json_frontend.cc). Batch flow only; the GUI path above keeps the
-        // plain loader (the bind never binds through the GUI).
+        // frontend/json_frontend.cc). The GUI path above threads it too
+        // (view_bind_live.sh binds live in the GUI).
         std::vector<std::string> import_frozen;
         if (vm.count("import-frozen"))
             import_frozen = vm["import-frozen"].as<std::vector<std::string>>();
