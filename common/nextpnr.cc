@@ -20,6 +20,8 @@
 #include "nextpnr.h"
 #include <set>
 #include <boost/algorithm/string.hpp>
+#include <cstdlib>
+#include <cstring>
 #include "design_utils.h"
 #include "log.h"
 #include "util.h"
@@ -656,8 +658,21 @@ int BaseCtx::bindRoutingLocsChecked(NetInfo *ni, const std::string &s)
     // net was tried first and route-fails -- a fresh path through a fully-frozen
     // CPU interior may not exist, while the severed branch is small (docs/124).
     // Each record's {wt,wi} is its own canonical dst wire (net->wires keys).
+    // Conflict POLICY (shortshift, owner 2026-07-28; SPLIT_BIND_REPLAY_CONFLICT):
+    //   sever-all (DEFAULT): a cross-gen collision drops BOTH nets' reused routing —
+    //     the loading net binds nothing and the owner net is fully unbound — so the
+    //     router solves a coherent fresh pair with each other's freed wires as
+    //     material. (The docs/124 trial dropped only the LOADING net while the owner
+    //     stayed frozen; that starves the fresh net and route-fails. Freeing both is
+    //     the new bet for the 4x16-BRAM replay drains.)
+    //   keep-one (legacy): first loader owns the wires; the later net severs its
+    //     colliding branches and reroutes just those (the docs/124 policy).
+    static const char *conflict_policy_env = getenv("SPLIT_BIND_REPLAY_CONFLICT");
+    static const bool sever_all =
+        (conflict_policy_env == nullptr) || (strcmp(conflict_policy_env, "sever-all") == 0);
     std::set<std::pair<int, int>> dead;
     const NetInfo *owner = nullptr;
+    std::set<NetInfo *> conflict_owners;
     bool root_dead = false;
     for (const auto &e : entries) {
         WireId w;
@@ -675,9 +690,34 @@ int BaseCtx::bindRoutingLocsChecked(NetInfo *ni, const std::string &s)
             dead.insert({e.wt, e.wi});
             if (!owner)
                 owner = (wo && wo != ni) ? wo : po;
+            conflict_owners.insert((wo && wo != ni) ? wo : (NetInfo *)po);
             if (e.pt < 0)
                 root_dead = true; // source wire itself is taken -- nothing bindable
         }
+    }
+    if (sever_all && !dead.empty()) {
+        // drop BOTH sides entirely: unbind every owner's reused tree, bind nothing here.
+        int freed = 0;
+        for (NetInfo *own : conflict_owners) {
+            std::vector<WireId> ws;
+            for (auto &item : own->wires)
+                ws.push_back(item.first);
+            for (WireId w : ws)
+                getCtx()->unbindWire(w);
+            freed += int(ws.size());
+            own->attrs.erase(id("REUSE_NET"));
+            reuse_bound_nets--;
+        }
+        reuse_bound_wires -= freed;
+        reuse_conflict_nets++;
+        reuse_root_dropped_nets++;
+        reuse_severed_wires += int(entries.size()) + freed;
+        if (reuse_conflict_nets <= 10)
+            log_warning("reuse locs conflict (sever-all): net '%s' collides with net '%s'; "
+                        "dropping BOTH nets' reused routing (%d + %d wires freed; both "
+                        "route fresh)\n",
+                        nameOf(ni), nameOf(owner), int(entries.size()), freed);
+        return 0; // no REUSE_NET mark -- both are plain fresh nets now
     }
     // Propagate death downstream: a record whose pip DRIVES FROM a dead wire is
     // disconnected from the kept tree. Fixpoint loop (records are unordered).
