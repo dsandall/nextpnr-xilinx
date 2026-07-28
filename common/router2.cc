@@ -26,6 +26,8 @@
  *
  */
 
+#include <cstdlib>
+#include <unordered_map>
 #include "router2.h"
 #include <algorithm>
 #include <boost/container/flat_map.hpp>
@@ -293,6 +295,62 @@ struct Router2
             nets.at(i).bb.y0 = std::max(nets.at(i).bb.y0 - cfg.bb_margin_y, 0);
             nets.at(i).bb.x1 = std::min(nets.at(i).bb.x1 + cfg.bb_margin_x, ctx->getGridDimX());
             nets.at(i).bb.y1 = std::min(nets.at(i).bb.y1 + cfg.bb_margin_y, ctx->getGridDimY());
+            // shortshift SPLIT_GEN_ROUTE_CONFINE (owner 2026-07-28, escalation "A"): at
+            // gen P&R, a net whose driver and EVERY user share one placement Region is
+            // region-internal — clamp its net + arc bounding boxes to the region rect
+            // plus the env-given margin, so gen-internal routing can never overspill
+            // the slot. Replayed trees from different gens then cannot collide by
+            // construction (the cross-gen sever machinery becomes a backstop).
+            // Env value = margin in tiles; unset = off (mono/bind unaffected).
+            {
+                static const char *rc_env = getenv("SPLIT_GEN_ROUTE_CONFINE");
+                static const int rc_margin = rc_env ? atoi(rc_env) : -1;
+                static std::unordered_map<Region *, ArcBounds> region_rects;
+                static int confined_nets = 0;
+                Region *reg = (rc_margin >= 0 && ni->driver.cell != nullptr)
+                                      ? ni->driver.cell->region
+                                      : nullptr;
+                if (reg != nullptr) {
+                    for (auto &usr : ni->users)
+                        if (usr.cell == nullptr || usr.cell->region != reg) {
+                            reg = nullptr;
+                            break;
+                        }
+                }
+                if (reg != nullptr) {
+                    auto rit = region_rects.find(reg);
+                    if (rit == region_rects.end()) {
+                        ArcBounds rb(std::numeric_limits<int>::max(), std::numeric_limits<int>::max(),
+                                     std::numeric_limits<int>::min(), std::numeric_limits<int>::min());
+                        for (BelId b : reg->bels) {
+                            Loc l = ctx->getBelLocation(b);
+                            rb.x0 = std::min(rb.x0, l.x);
+                            rb.y0 = std::min(rb.y0, l.y);
+                            rb.x1 = std::max(rb.x1, l.x);
+                            rb.y1 = std::max(rb.y1, l.y);
+                        }
+                        rit = region_rects.emplace(reg, rb).first;
+                    }
+                    ArcBounds rb = rit->second;
+                    rb.x0 = std::max(rb.x0 - rc_margin, 0);
+                    rb.y0 = std::max(rb.y0 - rc_margin, 0);
+                    rb.x1 = std::min(rb.x1 + rc_margin, ctx->getGridDimX());
+                    rb.y1 = std::min(rb.y1 + rc_margin, ctx->getGridDimY());
+                    auto clamp = [&](ArcBounds &bb) {
+                        bb.x0 = std::max(bb.x0, rb.x0);
+                        bb.y0 = std::max(bb.y0, rb.y0);
+                        bb.x1 = std::min(bb.x1, rb.x1);
+                        bb.y1 = std::min(bb.y1, rb.y1);
+                    };
+                    clamp(nets.at(i).bb);
+                    for (auto &arc : nets.at(i).arcs)
+                        clamp(arc.bb);
+                    if (confined_nets++ == 0)
+                        log_info("[route-confine] region-internal nets clamped to region "
+                                 "rect + margin %d (SPLIT_GEN_ROUTE_CONFINE)\n",
+                                 rc_margin);
+                }
+            }
             i++;
         }
     }
