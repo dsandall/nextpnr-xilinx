@@ -668,8 +668,18 @@ int BaseCtx::bindRoutingLocsChecked(NetInfo *ni, const std::string &s)
     //   keep-one (legacy): first loader owns the wires; the later net severs its
     //     colliding branches and reroutes just those (the docs/124 policy).
     static const char *conflict_policy_env = getenv("SPLIT_BIND_REPLAY_CONFLICT");
-    static const bool sever_all =
-        (conflict_policy_env == nullptr) || (strcmp(conflict_policy_env, "sever-all") == 0);
+    // keep-one | sever-all | auto (default). auto decides PER COLLISION (owner
+    // 2026-07-28): tiny severed branch -> patch it (keep-one mechanics); strongly
+    // size-asymmetric pair -> whole-drop the SMALLER net so the larger keeps/claims
+    // everything; big-vs-big -> patch (whole-dropping big trees is the proven loser).
+    static const int policy_mode = // 0=keep-one 1=sever-all 2=auto
+            (conflict_policy_env == nullptr)                    ? 2
+            : (strcmp(conflict_policy_env, "keep-one") == 0)    ? 0
+            : (strcmp(conflict_policy_env, "sever-all") == 0)   ? 1
+                                                                : 2;
+    static const int k_patch = getenv("SPLIT_BIND_REPLAY_KPATCH") ? atoi(getenv("SPLIT_BIND_REPLAY_KPATCH")) : 8;
+    static const int k_small = getenv("SPLIT_BIND_REPLAY_KSMALL") ? atoi(getenv("SPLIT_BIND_REPLAY_KSMALL")) : 32;
+    const bool sever_all = (policy_mode == 1);
     std::set<std::pair<int, int>> dead;
     const NetInfo *owner = nullptr;
     std::set<NetInfo *> conflict_owners;
@@ -694,6 +704,54 @@ int BaseCtx::bindRoutingLocsChecked(NetInfo *ni, const std::string &s)
             if (e.pt < 0)
                 root_dead = true; // source wire itself is taken -- nothing bindable
         }
+    }
+    if (policy_mode == 2 && !dead.empty() && !root_dead) {
+        // AUTO: per-collision decision table with telemetry.
+        int L = int(entries.size()), S = int(dead.size());
+        int minO = INT_MAX;
+        for (NetInfo *own : conflict_owners)
+            minO = std::min(minO, int(own->wires.size()));
+        const char *decision;
+        if (S <= k_patch) {
+            decision = "patch"; // fall through to keep-one mechanics below
+        } else if (std::min(L, minO) <= k_small) {
+            if (L <= minO) {
+                decision = "drop-loader";
+                reuse_conflict_nets++;
+                reuse_root_dropped_nets++;
+                reuse_severed_wires += L;
+                if (reuse_conflict_nets <= 20)
+                    log_info("[replay-auto] net '%s' vs '%s': L=%d O=%d S=%d -> drop-loader\n",
+                             nameOf(ni), nameOf(owner), L, minO, S);
+                return 0; // loader routes fresh; owners untouched
+            }
+            decision = "drop-owner";
+            int freed = 0;
+            for (NetInfo *own : conflict_owners) {
+                std::vector<WireId> ws;
+                for (auto &item : own->wires)
+                    ws.push_back(item.first);
+                for (WireId w : ws)
+                    getCtx()->unbindWire(w);
+                freed += int(ws.size());
+                own->attrs.erase(id("REUSE_NET"));
+                reuse_bound_nets--;
+            }
+            reuse_bound_wires -= freed;
+            reuse_conflict_nets++;
+            reuse_severed_wires += freed;
+            if (reuse_conflict_nets <= 20)
+                log_info("[replay-auto] net '%s' vs '%s': L=%d O=%d S=%d -> drop-owner "
+                         "(%d wires freed; loader binds FULL tree)\n",
+                         nameOf(ni), nameOf(owner), L, minO, S, freed);
+            dead.clear(); // contested wires are free now: bind everything below
+        } else {
+            decision = "patch-large";
+            if (reuse_conflict_nets < 20)
+                log_info("[replay-auto] net '%s' vs '%s': L=%d O=%d S=%d -> patch (big-vs-big)\n",
+                         nameOf(ni), nameOf(owner), L, minO, S);
+        }
+        (void)decision;
     }
     if (sever_all && !dead.empty()) {
         // drop BOTH sides entirely: unbind every owner's reused tree, bind nothing here.
