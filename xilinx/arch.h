@@ -1379,6 +1379,42 @@ struct Arch : BaseCtx
             if (--child_cnt[src] == 0 && !sinks.count(src) && parent.count(src))
                 work.push_back(src);
         }
+        // Source-connectivity pass (docs/239): the leaf prune above PROTECTS any stub
+        // whose leaf is a sink — a severed branch still ending at a real pin survives
+        // disconnected, and its stale one-driving-pip bindings then force the const
+        // backwards router down the severed direction ("Unrouteable $PACKER_GND_NET
+        // sink ...DIADI19", axil_h3 fuzzy). Drop every bound wire not reachable
+        // downstream from a root; orphaned sinks become plain unrouted arcs.
+        {
+            std::map<WireId, std::vector<WireId>> children;
+            std::vector<WireId> roots;
+            for (auto &it : net->wires) {
+                if (it.second.pip == PipId())
+                    roots.push_back(it.first);
+                else
+                    children[getPipSrcWire(it.second.pip)].push_back(it.first);
+            }
+            std::set<WireId> reach(roots.begin(), roots.end());
+            std::vector<WireId> bfs(roots.begin(), roots.end());
+            while (!bfs.empty()) {
+                WireId w = bfs.back();
+                bfs.pop_back();
+                auto cit = children.find(w);
+                if (cit == children.end())
+                    continue;
+                for (WireId c : cit->second)
+                    if (reach.insert(c).second)
+                        bfs.push_back(c);
+            }
+            std::vector<WireId> dead;
+            for (auto &it : net->wires)
+                if (!reach.count(it.first))
+                    dead.push_back(it.first);
+            for (WireId w : dead) {
+                unbindWire(w);
+                removed++;
+            }
+        }
         return removed;
     }
 
