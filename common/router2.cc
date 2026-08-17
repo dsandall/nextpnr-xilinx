@@ -144,6 +144,22 @@ struct Router2
         const char *p = getenv("SPLIT_REUSE_LIVELOCK_MAXW");
         return p ? atoi(p) : 64;       // aes_gen cascaded into a STAGNANT 28-wire set (>8)
     }();
+    // Plateau release (docs/223 class D): ABOVE the livelock band the breaker never
+    // arms, and a large stuck overuse (aes fuzzy: ~337 flat for 20+ iters) means the
+    // kept frozen routing holds exactly what the re-routes need — congestion pricing
+    // cannot evict frozen trees. Escalate the same way the breaker does, paced:
+    // after PLATEAU_RELEASE_ITERS non-improving iterations, rip the REUSED
+    // contestants on the overused wires (full re-route freedom), round-capped.
+    // Degrades the hot region toward placement-only routing freedom, which routes.
+    int plateau_release_iters = [] {   // 0 disables; only armed under livelock_break
+        const char *p = getenv("SPLIT_PLATEAU_RELEASE_ITERS");
+        return p ? atoi(p) : 20;
+    }();
+    int plateau_rounds_max = [] {
+        const char *p = getenv("SPLIT_PLATEAU_ROUNDS");
+        return p ? atoi(p) : 10;
+    }();
+    int plateau_rounds_done = 0;
     int _overuse_seen = 0;        // SPLIT_DUMP_OVERUSE: iters with overuse seen, to dump once
 
     // D1 Phase-0 overuse-plateau diagnostic (docs/140 D1 = docs/131 Phase-0, repointed).
@@ -2235,6 +2251,46 @@ struct Router2
                     stall_iters = 0;
                 } else {
                     ++stall_iters;
+                }
+                // Plateau release (see knob comment at plateau_release_iters): fires
+                // only above the livelock band (below it the breaker owns escalation),
+                // only under the fuzzy/livelock gate (unset-knob flow stays
+                // bit-identical), and only while reused contestants remain — a round
+                // that finds none leaves the stall guard to abort as before.
+                if (livelock_break && plateau_release_iters > 0 &&
+                    stall_iters >= plateau_release_iters &&
+                    overused_wires > livelock_maxw &&
+                    plateau_rounds_done < plateau_rounds_max) {
+                    int ripped = 0, contested = 0;
+                    for (auto &wire : flat_wires) {
+                        if (int(wire.bound_nets.size()) <= 1)
+                            continue;
+                        contested++;
+                        std::vector<int> owners;
+                        for (auto &b : wire.bound_nets)
+                            if (nets.at(b.first).is_reuse)
+                                owners.push_back(b.first);
+                        for (int ow : owners) {
+                            NetInfo *oni = nets_by_udata.at(ow);
+                            for (size_t a = 0; a < nets.at(ow).arcs.size(); a++)
+                                ripup_arc(oni, a);
+                            nets.at(ow).is_reuse = false;
+                            failed_nets.insert(ow);
+                            yield_ripped.insert(ow); // docs/157: survive the requeue clear
+                            ripped++;
+                        }
+                    }
+                    plateau_rounds_done++;
+                    log_info("fuzzy: plateau release r%d/%d: overuse=%d (%d wires) stuck "
+                             "%d iters above livelock band — ripped %d reused net(s) on "
+                             "%d contested wires\n",
+                             plateau_rounds_done, plateau_rounds_max, total_overuse,
+                             overused_wires, stall_iters, ripped, contested);
+                    if (ripped > 0) {
+                        stall_iters = 0;
+                        stall_best_wires = std::numeric_limits<int>::max();
+                        stall_best_overuse = std::numeric_limits<int>::max();
+                    }
                 }
                 if (stall_iter_limit > 0 && stall_iters >= stall_iter_limit) {
                     for (auto &wire : flat_wires) {
