@@ -2345,6 +2345,11 @@ struct Router2
                     stall_best_wires = overused_wires;
                     stall_best_overuse = total_overuse;
                     stall_iters = 0;
+                    // stagnation clock (docs/239): the wall counts seconds since the
+                    // LAST IMPROVEMENT, not since loop start — a heavy fuzzy whose
+                    // iterations cost ~90s must not die mid-descent (axil_h3:
+                    // 1333 -> 7 needs ~8 min of honest convergence).
+                    route_loop_t0 = std::chrono::steady_clock::now();
                 } else {
                     ++stall_iters;
                 }
@@ -2393,9 +2398,9 @@ struct Router2
                                      .count());
                 bool wall_hit = wall_limit_s > 0 && wall_s >= wall_limit_s;
                 if (wall_hit)
-                    log_info("[wall] route loop at %ds >= SPLIT_ROUTER_WALL_LIMIT_S=%d "
-                             "with overuse remaining — aborting with the stall "
-                             "diagnostics\n",
+                    log_info("[wall] route loop STAGNANT %ds >= SPLIT_ROUTER_WALL_LIMIT_S=%d "
+                             "(clock resets on any overuse improvement) — aborting with "
+                             "the stall diagnostics\n",
                              wall_s, wall_limit_s);
                 if (wall_hit || (stall_iter_limit > 0 && stall_iters >= stall_iter_limit)) {
                     for (auto &wire : flat_wires) {
