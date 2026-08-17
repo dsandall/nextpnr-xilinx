@@ -953,7 +953,14 @@ struct Router2
                     auto &wd = flat_wires[next];
                     if (wd.unavailable)
                         continue;
-                    if (wd.reserved_net != -1 && wd.reserved_net != net->udata)
+                    // Soft reservations (docs/238/239): the const backwards router has
+                    // its own hard reservation reject, so a severed GND/VCC branch to a
+                    // frozen BRAM pin walls out exactly like the class-D signal drains
+                    // ("Unrouteable $PACKER_GND_NET sink ...DIADI19"). On escalation
+                    // passes (allowed_cong > 0 — the loop that already tolerates
+                    // congestion) let it cross foreign reservations too.
+                    if (wd.reserved_net != -1 && wd.reserved_net != net->udata &&
+                        !(soft_resv && allowed_cong > 0))
                         continue;
                     if (int(wd.bound_nets.size()) > (allowed_cong + 1) ||
                         (allowed_cong == 0 && wd.bound_nets.size() == 1 && !wd.bound_nets.count(net->udata)))
