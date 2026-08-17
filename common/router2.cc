@@ -993,6 +993,41 @@ struct Router2
                 return;
             }
         }
+        // Forensics before dying (docs/239): name what walls the const backwards
+        // search — for each wire in the sink's 3-level uphill cone, the pip owner /
+        // availability / reservation, so "Unrouteable $PACKER_GND_NET" failures
+        // carry their blocker instead of just the sink name.
+        {
+            std::set<WireId> seen{dst_wire};
+            std::vector<WireId> frontier{dst_wire};
+            int shown = 0;
+            for (int depth = 1; depth <= 3 && !frontier.empty() && shown < 40; depth++) {
+                std::vector<WireId> next_f;
+                for (WireId fw : frontier) {
+                    for (auto uh : ctx->getPipsUphill(fw)) {
+                        WireId sw = ctx->getPipSrcWire(uh);
+                        if (seen.count(sw))
+                            continue;
+                        seen.insert(sw);
+                        next_f.push_back(sw);
+                        if (shown >= 40)
+                            continue;
+                        shown++;
+                        NetInfo *own = ctx->getBoundPipNet(uh);
+                        auto &swd = wire_data(sw);
+                        log_info("  [const-diag] d%d %s via %s pipavail=%d owner=%s "
+                                 "unavail=%d resv=%s bound=%d\n",
+                                 depth, ctx->nameOfWire(sw), ctx->nameOfPip(uh),
+                                 int(ctx->checkPipAvail(uh)), own ? ctx->nameOf(own) : "-",
+                                 int(swd.unavailable),
+                                 swd.reserved_net == -1 ? "-"
+                                                        : ctx->nameOf(nets_by_udata.at(swd.reserved_net)),
+                                 int(swd.bound_nets.size()));
+                    }
+                }
+                frontier = next_f;
+            }
+        }
         log_error("Unrouteable %s sink %s.%s (%s)\n", ctx->nameOf(net), ctx->nameOf(net->users.at(i).cell),
                   ctx->nameOf(net->users.at(i).port), ctx->nameOfWire(dst_wire));
     }
