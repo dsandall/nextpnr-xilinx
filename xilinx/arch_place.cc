@@ -468,6 +468,47 @@ bool Arch::xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const
 
             // FF2 might use X, if it isn't driven directly
             CellInfo *ff2 = lts.cells[i << 4 | BEL_FF2];
+            // class J — entombed FF (docs/240): under frozen import, frozen nets can
+            // ROUTE THROUGH a slice's XMUX with no frozen cell present, invisible to
+            // cell-based validity. A moved/fresh FF2 placed here has its Q walled in
+            // (its only fabric exit is the XMUX): the router drains instantly
+            // (rej{pip=1}). Reject the eighth when FF2's Q has fabric users and no
+            // free exit exists within two pip levels. frozen_routing_active is never
+            // set in stock builds, so this is unreachable there.
+            if (frozen_routing_active && ff2 != nullptr && ff2->bel != BelId() &&
+                ff2->attrs.count(id("X_FROZEN")) == 0) {
+                auto qit = ff2->ports.find(id("Q"));
+                NetInfo *qn = (qit != ff2->ports.end()) ? qit->second.net : nullptr;
+                if (qn != nullptr && !qn->users.empty()) {
+                    bool escapes = false;
+                    WireId qw = getBelPinWire(ff2->bel, id("Q"));
+                    for (auto p1 : getPipsDownhill(qw)) {
+                        if (escapes)
+                            break;
+                        NetInfo *o1 = getBoundPipNet(p1);
+                        if (o1 != nullptr && o1 != qn)
+                            continue;
+                        WireId w1 = getPipDstWire(p1);
+                        NetInfo *b1 = getBoundWireNet(w1);
+                        if (b1 != nullptr && b1 != qn)
+                            continue;
+                        for (auto p2 : getPipsDownhill(w1)) {
+                            NetInfo *o2 = getBoundPipNet(p2);
+                            if (o2 != nullptr && o2 != qn)
+                                continue;
+                            NetInfo *b2 = getBoundWireNet(getPipDstWire(p2));
+                            if (b2 == nullptr || b2 == qn) {
+                                escapes = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!escapes) {
+                        DBG();
+                        return false;
+                    }
+                }
+            }
             if (ff2 != nullptr && ff2->ffInfo.d != nullptr && ff2->ffInfo.d->driver.cell != nullptr) {
                 auto &drv = ff2->ffInfo.d->driver;
                 if (drv.cell == lut5) {

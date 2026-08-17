@@ -1434,6 +1434,10 @@ struct Arch : BaseCtx
         // net wants, so a ripped reused arc reroutes AROUND the contested wire instead
         // of ping-ponging back onto it.
         net->attrs[id("REUSE_NET")] = Property(1);
+        // class J gate (docs/240): frozen routing exists from here on — placement
+        // validity may consult wire binding (stock builds never set this, so the
+        // entombment check below stays unreachable and behavior is bit-identical).
+        frozen_routing_active = true;
         size_t pos = 0;
         while (pos < s.size()) {
             int wt = 0, wi = 0, pt = 0, pi = 0;
@@ -1860,6 +1864,9 @@ struct Arch : BaseCtx
     // Return true whether all Bels at a given location are valid
     bool isBelLocationValid(BelId bel) const;
 
+    // class J (docs/240): set by bindNetRoutingLocs; validity may then reject
+    // bels whose only fabric exit is consumed by frozen route-throughs.
+    mutable bool frozen_routing_active = false;
     bool xcu_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const;
     bool xc7_logic_tile_valid(IdString tileType, LogicTileStatus &lts) const;
 
