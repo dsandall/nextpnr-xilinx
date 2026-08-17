@@ -1776,6 +1776,15 @@ struct Router2
                 std::vector<int> owners;
                 for (auto &b : wire.bound_nets)
                     owners.push_back(b.first);
+                // Symmetry breaking (docs/239): ripping BOTH contestants of a two-net
+                // contest recreates the identical tie every round — deterministic
+                // re-routes re-derive the same paths (observed: 54 rips over 5 rounds,
+                // 7 BYP_ALT*/FAN_ALT* wires, overuse flat at 7 for 75 iters). From
+                // round 2, rip only ONE contestant (alternating across rounds); the
+                // survivor keeps the wire bound, so the ripped net's A* must route
+                // around it instead of re-tying.
+                if (livelock_rounds >= 2 && owners.size() == 2)
+                    owners = {owners[livelock_rounds % 2]};
                 for (int ow : owners) {
                     // Round 1: net-level yield for the REUSED contestants only. If the
                     // livelock survives that (fresh-vs-fresh: both trees bias their
