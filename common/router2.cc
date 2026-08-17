@@ -160,8 +160,14 @@ struct Router2
         return p ? atoi(p) : 10;
     }();
     int plateau_rounds_done = 0;
-    // Soft reservations (docs/238): armed by env; see the trespass site in route_arc.
-    bool soft_resv = getenv("SPLIT_SOFT_RESV") != nullptr;
+    // Soft reservations (docs/238): DEFAULT ON (owner adoption 2026-08-17) — the
+    // trespass path only activates for nets already past a failed attempt, so
+    // healthy routes never see it. SPLIT_SOFT_RESV=0 restores the hard-reject
+    // behavior (the A/B baseline).
+    bool soft_resv = [] {
+        const char *p = getenv("SPLIT_SOFT_RESV");
+        return !(p && (*p == '0' || *p == '\0'));
+    }();
     float soft_resv_penalty_ns = [] {
         const char *p = getenv("SPLIT_SOFT_RESV_PENALTY_NS");
         return p ? float(atof(p)) : 25.0f;
