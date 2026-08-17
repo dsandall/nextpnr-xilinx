@@ -1394,25 +1394,34 @@ struct Arch : BaseCtx
                 else
                     children[getPipSrcWire(it.second.pip)].push_back(it.first);
             }
-            std::set<WireId> reach(roots.begin(), roots.end());
-            std::vector<WireId> bfs(roots.begin(), roots.end());
-            while (!bfs.empty()) {
-                WireId w = bfs.back();
-                bfs.pop_back();
-                auto cit = children.find(w);
-                if (cit == children.end())
-                    continue;
-                for (WireId c : cit->second)
-                    if (reach.insert(c).second)
-                        bfs.push_back(c);
-            }
-            std::vector<WireId> dead;
-            for (auto &it : net->wires)
-                if (!reach.count(it.first))
-                    dead.push_back(it.first);
-            for (WireId w : dead) {
-                unbindWire(w);
-                removed++;
+            // Rootless nets: thousands of frozen nets bind without an explicit root
+            // entry — treating them as all-dead massacres legitimate replay (-5.8k
+            // kept arcs on axil_h3). Their headless state is the replay machinery's
+            // business (root_dropped_nets); skip them — EXCEPT const nets, which
+            // rebuild from the pseudo-network and whose stale stubs are the actual
+            // DIADI19 wall.
+            bool is_const = net->name == id("$PACKER_GND_NET") || net->name == id("$PACKER_VCC_NET");
+            if (!roots.empty() || is_const) {
+                std::set<WireId> reach(roots.begin(), roots.end());
+                std::vector<WireId> bfs(roots.begin(), roots.end());
+                while (!bfs.empty()) {
+                    WireId w = bfs.back();
+                    bfs.pop_back();
+                    auto cit = children.find(w);
+                    if (cit == children.end())
+                        continue;
+                    for (WireId c : cit->second)
+                        if (reach.insert(c).second)
+                            bfs.push_back(c);
+                }
+                std::vector<WireId> dead;
+                for (auto &it : net->wires)
+                    if (!reach.count(it.first))
+                        dead.push_back(it.first);
+                for (WireId w : dead) {
+                    unbindWire(w);
+                    removed++;
+                }
             }
         }
         return removed;
