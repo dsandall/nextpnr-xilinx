@@ -160,6 +160,12 @@ struct Router2
         return p ? atoi(p) : 10;
     }();
     int plateau_rounds_done = 0;
+    // Soft reservations (docs/238): armed by env; see the trespass site in route_arc.
+    bool soft_resv = getenv("SPLIT_SOFT_RESV") != nullptr;
+    float soft_resv_penalty_ns = [] {
+        const char *p = getenv("SPLIT_SOFT_RESV_PENALTY_NS");
+        return p ? float(atof(p)) : 25.0f;
+    }();
     int _overuse_seen = 0;        // SPLIT_DUMP_OVERUSE: iters with overuse seen, to dump once
 
     // D1 Phase-0 overuse-plateau diagnostic (docs/140 D1 = docs/131 Phase-0, repointed).
@@ -208,6 +214,15 @@ struct Router2
         const char *p = getenv("SPLIT_ROUTER_STALL_ITERS");
         return p ? atoi(p) : 75;
     }();
+    // Wall-clock ceiling (owner 2026-08-16, the HEAP "bind-route wall-clock ceiling"
+    // call): a route loop still unconverged after this many seconds is an abort with
+    // the same named-wire diagnostics as the stall — slow-but-monotonic convergence
+    // does NOT excuse it, unlike the stall counter. 0 disables (stock).
+    int wall_limit_s = [] {
+        const char *p = getenv("SPLIT_ROUTER_WALL_LIMIT_S");
+        return p ? atoi(p) : 200;
+    }();
+    std::chrono::steady_clock::time_point route_loop_t0;
     int stall_best_wires = std::numeric_limits<int>::max();
     int stall_best_overuse = std::numeric_limits<int>::max();
     int stall_iters = 0; // consecutive iterations without improvement
@@ -1129,7 +1144,8 @@ struct Router2
         // heuristic is incorrect.
         bool must_drain_queue = !is_bb;
         // SPLIT_REUSE_DIAG: per-rejection-reason counters for this arc's A*.
-        long rj_bb = 0, rj_pip = 0, rj_unavail = 0, rj_reserved = 0, rj_ownpip = 0, rj_ttw = 0;
+        long rj_bb = 0, rj_pip = 0, rj_unavail = 0, rj_reserved = 0, rj_ownpip = 0, rj_ttw = 0,
+             rj_resv_soft = 0;
         while (!t.queue.empty() && (must_drain_queue || iter < toexplore)) {
             auto curr = t.queue.top();
             auto &d = flat_wires.at(curr.wire);
@@ -1172,7 +1188,18 @@ struct Router2
                     rj_unavail++;
                     continue;
                 }
-                if (nwd.reserved_net != -1 && nwd.reserved_net != net->udata) {
+                // Soft reservations (docs/223 class D, docs/238): in a frozen bind the
+                // free fabric is thin and many sinks' short forced cones mutually
+                // reserve it — hard-rejecting reserved wires walls starving nets into
+                // 2M-iteration A* drains (rej resv-dominated). When armed, a net on
+                // its RETRY pass (or one that has already failed an iteration) may
+                // trespass a foreign reservation at a steep cost adder; PathFinder's
+                // congestion pricing then arbitrates the real conflicts. First
+                // attempts stay stock; unset env stays bit-identical.
+                bool resv_foreign = nwd.reserved_net != -1 && nwd.reserved_net != net->udata;
+                bool resv_trespass = resv_foreign && soft_resv &&
+                                     (!is_bb || nets.at(net->udata).fail_count > 0);
+                if (resv_foreign && !resv_trespass) {
                     rj_reserved++;
                     continue;
                 }
@@ -1184,8 +1211,11 @@ struct Router2
                     rj_ttw++;
                     continue; // thread safety issue
                 }
+                if (resv_trespass)
+                    rj_resv_soft++;
                 WireScore next_score;
-                next_score.cost = curr.score.cost + score_wire_for_arc(net, i, next, dh);
+                next_score.cost = curr.score.cost + score_wire_for_arc(net, i, next, dh) +
+                                  (resv_trespass ? soft_resv_penalty_ns : 0.0f);
                 next_score.delay =
                         curr.score.delay + ctx->getPipDelay(dh).maxDelay() + ctx->getWireDelay(next).maxDelay();
                 next_score.togo_cost = cfg.estimate_weight * get_togo_cost(net, i, next_idx, dst_wire);
@@ -1213,10 +1243,11 @@ struct Router2
         if (dg_on && iter > 20000 && t.dg_boom_logged < 8) {
             t.dg_boom_logged++;
             log_info("[reuse-diag] BOOM net=%s arc=%d iters=%d explored=%d src=%s dst=%s reuse=%d "
-                     "rej{bb=%ld pip=%ld unavail=%ld resv=%ld ownpip=%ld ttw=%ld}\n",
+                     "rej{bb=%ld pip=%ld unavail=%ld resv=%ld soft=%ld ownpip=%ld ttw=%ld}\n",
                      ctx->nameOf(net), int(i), iter, explored,
                      ctx->nameOfWire(ctx->getNetinfoSourceWire(net)), ctx->nameOfWire(dst_wire),
                      int(nets.at(net->udata).is_reuse), rj_bb, rj_pip, rj_unavail, rj_reserved,
+                     rj_resv_soft,
                      rj_ownpip, rj_ttw);
         }
         if (was_visited(dst_wire_idx)) {
@@ -1246,9 +1277,9 @@ struct Router2
         } else {
             if (!is_bb)   // unbounded retry exhausted: name what rejected the frontier
                 log_info("[fail-diag] arc %d of %s: A* drained after %d iters; "
-                         "rej{bb=%ld pip=%ld unavail=%ld resv=%ld ownpip=%ld ttw=%ld}\n",
+                         "rej{bb=%ld pip=%ld unavail=%ld resv=%ld soft=%ld ownpip=%ld ttw=%ld}\n",
                          int(i), ctx->nameOf(net), iter, rj_bb, rj_pip, rj_unavail,
-                         rj_reserved, rj_ownpip, rj_ttw);
+                         rj_reserved, rj_resv_soft, rj_ownpip, rj_ttw);
             reset_wires(t);
             return ARC_RETRY_WITHOUT_BB;
         }
@@ -1597,7 +1628,14 @@ struct Router2
         // flags, so split-flow reuse contention is visible. Prints once then disables.
         static bool _dumped = false;
         if (!_dumped && overused_wires > 0 && getenv("SPLIT_DUMP_OVERUSE")) {
-            if (++_overuse_seen > 40) {
+            // trigger iteration is tunable so the census fits inside the wall-clock
+            // ceiling (owner 200s rule): SPLIT_DUMP_OVERUSE=<n> dumps after n
+            // overuse-iterations; bare/non-numeric keeps the historical 40.
+            static const int _dump_at = [] {
+                int v = atoi(getenv("SPLIT_DUMP_OVERUSE"));
+                return v > 1 ? v : 40;
+            }();
+            if (++_overuse_seen > _dump_at) {
                 _dumped = true;
                 int nsite = 0, nint = 0, nfresh = 0, shown = 0;
                 for (auto &wire : flat_wires) {
@@ -2176,6 +2214,7 @@ struct Router2
         // finalCheck handling after the loop) and can be skipped.
         bool last_bind_ok = false;
         log_info("Running main router loop...\n");
+        route_loop_t0 = std::chrono::steady_clock::now();
         do {
             d1_iter = iter; // D1 Phase-0: expose the loop iteration to update_congestion's trace
             ctx->sorted_shuffle(route_queue);
@@ -2292,7 +2331,16 @@ struct Router2
                         stall_best_overuse = std::numeric_limits<int>::max();
                     }
                 }
-                if (stall_iter_limit > 0 && stall_iters >= stall_iter_limit) {
+                int wall_s = int(std::chrono::duration_cast<std::chrono::seconds>(
+                                     std::chrono::steady_clock::now() - route_loop_t0)
+                                     .count());
+                bool wall_hit = wall_limit_s > 0 && wall_s >= wall_limit_s;
+                if (wall_hit)
+                    log_info("[wall] route loop at %ds >= SPLIT_ROUTER_WALL_LIMIT_S=%d "
+                             "with overuse remaining — aborting with the stall "
+                             "diagnostics\n",
+                             wall_s, wall_limit_s);
+                if (wall_hit || (stall_iter_limit > 0 && stall_iters >= stall_iter_limit)) {
                     for (auto &wire : flat_wires) {
                         if (int(wire.bound_nets.size()) <= 1)
                             continue;
