@@ -607,6 +607,67 @@ struct Router2
         return int(owners.size());
     }
 
+    // Source-side demand yield (docs/240 class J, routing half): a frozen-unmoved
+    // launch FF whose net was severed can be ENTOMBED at the source — its only
+    // fabric exit (the slice XMUX) is held by a reused route-through. The sink-side
+    // demand_yield above cones uphill from the starved SINK and never sees this.
+    // Mirror it downhill from the source wire: rip the reused owners of the exit
+    // cone (3 levels), releasing their claims + reservations.
+    int demand_yield_src(NetInfo *net, WireId sw)
+    {
+        std::set<int> owners;
+        std::set<WireId> seen{sw};
+        std::vector<WireId> frontier{sw};
+        for (int depth = 0; depth < 3 && !frontier.empty(); depth++) {
+            std::vector<WireId> next;
+            for (WireId fw : frontier) {
+                for (auto dh : ctx->getPipsDownhill(fw)) {
+                    NetInfo *po = ctx->getBoundPipNet(dh);
+                    if (po != nullptr && po != net && nets.at(po->udata).is_reuse)
+                        owners.insert(po->udata);
+                    WireId dw2 = ctx->getPipDstWire(dh);
+                    auto &dwd = wire_data(dw2);
+                    for (auto bn : dwd.bound_nets)
+                        if (bn.first != net->udata && nets.at(bn.first).is_reuse)
+                            owners.insert(bn.first);
+                    if (dwd.reserved_net != -1 && dwd.reserved_net != net->udata &&
+                        nets.at(dwd.reserved_net).is_reuse)
+                        owners.insert(dwd.reserved_net);
+                    if (!seen.count(dw2)) {
+                        seen.insert(dw2);
+                        next.push_back(dw2);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        for (int ow : owners) {
+            NetInfo *oni = nets_by_udata.at(ow);
+            log_info("fuzzy: demand yield (src): ripping reused net '%s' entombing source %s of '%s'\n",
+                     ctx->nameOf(oni), ctx->nameOfWire(sw), ctx->nameOf(net));
+            for (size_t a = 0; a < nets.at(ow).arcs.size(); a++)
+                ripup_arc(oni, a);
+            std::vector<WireId> awires;
+            for (auto &w : oni->wires)
+                awires.push_back(w.first);
+            for (WireId w : awires)
+                ctx->unbindWire(w);
+            for (auto &ad : nets.at(ow).arcs)
+                ad.routed = false;
+            nets.at(ow).is_reuse = false;
+            failed_nets.insert(ow);
+            yield_ripped.insert(ow); // docs/157
+        }
+        if (!owners.empty()) {
+            for (WireId fw : seen) {
+                auto &fwd = wire_data(fw);
+                if (fwd.reserved_net != -1 && owners.count(fwd.reserved_net))
+                    fwd.reserved_net = -1;
+            }
+        }
+        return int(owners.size());
+    }
+
     void ripup_arc(NetInfo *net, size_t user)
     {
         auto &ad = nets.at(net->udata).arcs.at(user);
@@ -1441,7 +1502,9 @@ struct Router2
                     // and retry the arc once.
                     if (res2 != ARC_SUCCESS && livelock_break) {
                         WireId dw = ctx->getNetinfoSinkWire(net, net->users.at(i));
-                        if (demand_yield(net, dw) > 0)
+                        int freed = demand_yield(net, dw);
+                        freed += demand_yield_src(net, nets.at(net->udata).src_wire);
+                        if (freed > 0)
                             res2 = route_arc(t, net, i, is_mt, false);
                     }
                     // If this also fails, no choice but to give up
