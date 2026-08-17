@@ -699,6 +699,25 @@ struct Router2
         return true;
     }
 
+    // split-flow docs/223 class D: the reservation walk below extends while the cone
+    // has exactly ONE driveable uphill wire. In a frozen bind checkPipAvail excludes
+    // every frozen-web pip, so a normal 3-6 hop site cone becomes an arbitrarily long
+    // "forced" chain into general routing, and the fixed-point loop cascades chains
+    // off each other (reserved-by-other => undriveable => neighbor's cone forced too).
+    // Result: 10k+ general-routing wires reserved, and reservations are hard A*
+    // rejects — the resv-dominated drain. Reservations are a site-cone optimization,
+    // not a correctness requirement, so cap the walk. 0 = unlimited (stock).
+    int reserve_max_hops()
+    {
+        static int cap = -1;
+        if (cap == -1) {
+            const char *e = getenv("SPLIT_RESERVE_MAX_HOPS");
+            cap = e ? atoi(e) : 12;
+        }
+        return cap;
+    }
+    long reserve_clipped = 0;
+
     // Find all the wires that must be used to route a given arc
     bool reserve_wires_for_arc(NetInfo *net, size_t i)
     {
@@ -710,6 +729,7 @@ struct Router2
         pool<WireId> rsv;
         WireId cursor = sink;
         bool done = false;
+        int hops = 0;
         if (ctx->debug)
             log("reserving wires for arc %d of net %s\n", int(i), ctx->nameOf(net));
         while (!done) {
@@ -720,6 +740,10 @@ struct Router2
             wd.reserved_net = net->udata;
             if (cursor == src)
                 break;
+            if (reserve_max_hops() > 0 && ++hops >= reserve_max_hops()) {
+                reserve_clipped++;
+                break;
+            }
             WireId next_cursor;
             for (auto uh : ctx->getPipsUphill(cursor)) {
                 WireId w = ctx->getPipSrcWire(uh);
@@ -752,6 +776,10 @@ struct Router2
                     did_something |= reserve_wires_for_arc(net, i);
             }
         } while (did_something);
+        if (reserve_clipped > 0)
+            log_info("reservation walks clipped at %d hops: %ld (SPLIT_RESERVE_MAX_HOPS; "
+                     "0 = unlimited/stock)\n",
+                     reserve_max_hops(), reserve_clipped);
     }
 
     void reset_wires(ThreadContext &t)
