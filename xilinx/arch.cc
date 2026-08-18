@@ -810,7 +810,19 @@ bool Arch::place()
         cfg.ioBufTypes.insert(id_PSEUDO_GND);
         cfg.ioBufTypes.insert(id_PSEUDO_VCC);
         cfg.alpha = 0.08;
+        // Placement spread (shortshift docs/243, contract knob gen_heap_beta): the
+        // HeAP bin-fill limit. The engine sets SPLIT_GEN_HEAP_BETA for GEN P&R only;
+        // unset (mono, the bind, stock runs) keeps the historical 0.4.
         cfg.beta = 0.4;
+        if (const char *b = getenv("SPLIT_GEN_HEAP_BETA")) {
+            float v = atof(b);
+            if (v > 0.01f && v <= 1.0f) {
+                cfg.beta = v;
+                log_info("placer: SPLIT_GEN_HEAP_BETA=%s (bin-fill limit %.2f)\n", b, v);
+            } else {
+                log_error("SPLIT_GEN_HEAP_BETA=%s out of range (0.01, 1.0]\n", b);
+            }
+        }
         cfg.placeAllAtOnce = true;
         cfg.hpwl_scale_x = 1;
         cfg.hpwl_scale_y = 2;
