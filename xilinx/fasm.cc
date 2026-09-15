@@ -23,6 +23,7 @@
 #include <boost/range/adaptor/reversed.hpp>
 #include <cctype>
 #include <fstream>
+#include <set>
 #include "log.h"
 #include "nextpnr.h"
 #include "version.h"
@@ -5249,11 +5250,31 @@ void write_gtx_channel(CellInfo *ci)
         auto dsp = "DSP_" + std::to_string(xy.y);
         push(dsp);
 
+        // Pins the packer tied inside the tile (DSP_GND_PINS / DSP_VCC_PINS) carry their
+        // logical value in the tile bit itself, and the site inverter stays out of the way:
+        // write_const_pins() below already folds a requested inversion into the constant it
+        // emits, so leaving IS_<pin>_INVERTED to reach the bitstream inverts such a pin a
+        // second time.  Vivado encodes them the same way -- bit-diffed on xc7k70tfbg676-2
+        // (Vivado 2025.2, one LOC'd DSP48E1 per bitstream, prjxray-db kintex7): a constant 0
+        // is DSP_<n>_<PIN>.DSP_GND_<side> and a constant 1 is DSP_<n>_<PIN>.DSP_VCC_<side>,
+        // with ZIS_<PIN>_INVERTED set (not inverted) in both cases, and no routing bit
+        // anywhere on the device differing between the two.
+        std::set<std::string> tile_tied;
+        for (auto attr : {"DSP_GND_PINS", "DSP_VCC_PINS"}) {
+            std::vector<std::string> pins;
+            boost::split(pins, str_or_default(ci->attrs, ctx->id(attr), ""), boost::is_any_of(" "));
+            for (auto &pin : pins)
+                if (!pin.empty())
+                    tile_tied.insert(pin);
+        }
+
         auto write_bus_zinv = [&](std::string name, int width) {
             for (int i = 0; i < width; i++) {
                 std::string b = stringf("[%d]", i);
                 bool inv = (int_or_default(ci->params, ctx->id("IS_" + name + "_INVERTED"), 0) >> i) & 0x1;
                 inv |= bool_or_default(ci->params, ctx->id("IS_" + name + b + "_INVERTED"), false);
+                if (tile_tied.count(name + std::to_string(i)))
+                    inv = false;
                 write_bit("ZIS_" + name + "_INVERTED" + b, !inv);
             }
         };
