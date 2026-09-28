@@ -223,6 +223,8 @@ void XC7Packer::pack_carries()
 
     const bool fold_dead = fold_enabled("carry-dead");
     const bool fold_di = fold_enabled("carry-di");
+    const bool fold_s = fold_di && fold_enabled("carry-s");
+    int s_absorbed = 0;
     int dead_feeds = 0, di_bypass = 0;
     if (fold_di)
         ctx->carry_di_ax = true;
@@ -376,6 +378,16 @@ void XC7Packer::pack_carries()
                         (lut_types.count(c4_s->driver.cell->type) || c4_s->driver.cell->type == ctx->id("LUT6"))) {
                         s_lut = c4_s->driver.cell;
                         s_n = lut_inputs(s_lut, 6, ins);
+                    } else if (fold_s && c4_s && c4_s->driver.cell != nullptr && c4_s->driver.port == ctx->id("O") &&
+                               (lut_types.count(c4_s->driver.cell->type) ||
+                                c4_s->driver.cell->type == ctx->id("LUT6")) &&
+                               !is_constrained(c4_s->driver.cell) && c4_s->driver.cell->constr_children.empty() &&
+                               !is_frozen(c4_s->driver.cell)) {
+                        // A LUT with other sinks still fits the eighth: O6 feeds S and leaves the
+                        // slice for the rest, so it moves in instead of a feed-through joining it.
+                        s_lut = c4_s->driver.cell;
+                        s_n = lut_inputs(s_lut, 6, ins);
+                        ++s_absorbed;
                     } else if (c4_s) {
                         ins.insert(c4_s->name); // the S feed-through's input
                     }
@@ -449,6 +461,8 @@ void XC7Packer::pack_carries()
         log_info("   Dropped %d feed-through LUTs on dead carry positions.\n", dead_feeds);
     if (fold_di)
         log_info("   Routed %d carry DI inputs through the AX bypass.\n", di_bypass);
+    if (fold_s)
+        log_info("   Moved %d multi-fanout S-driving LUTs into their carry eighth.\n", s_absorbed);
 
     for (auto net : folded_nets)
         ctx->nets.erase(net);
