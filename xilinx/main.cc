@@ -50,6 +50,8 @@ po::options_description UspCommandHandler::getArchOptions()
     specific.add_options()("chipdb", po::value<std::string>(), "name of chip database binary");
     specific.add_options()("xdc", po::value<std::vector<std::string>>(), "XDC-style constraints file");
     specific.add_options()("fasm", po::value<std::string>(), "fasm bitstream file to write");
+    specific.add_options()("xilinx-pack-fold-luts", po::value<std::string>()->implicit_value("all"),
+                           "fold packer-inserted LUTs; comma list of: inv (default when bare: all)");
 
     return specific;
 }
@@ -74,6 +76,8 @@ std::unique_ptr<Context> UspCommandHandler::createContext(std::unordered_map<std
 
 void UspCommandHandler::customAfterLoad(Context *ctx)
 {
+    if (vm.count("xilinx-pack-fold-luts"))
+        ctx->settings[ctx->id("xilinx/packFoldLuts")] = vm["xilinx-pack-fold-luts"].as<std::string>();
     if (vm.count("xdc")) {
         std::vector<std::string> files = vm["xdc"].as<std::vector<std::string>>();
         for (const auto &filename : files) {
