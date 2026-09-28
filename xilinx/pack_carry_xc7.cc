@@ -221,8 +221,31 @@ void XC7Packer::pack_carries()
 
     std::unordered_set<IdString> folded_nets;
 
+    const bool fold_dead = fold_enabled("carry-dead");
+    int dead_feeds = 0;
+
     for (auto &grp : groups) {
         std::vector<std::unique_ptr<CellInfo>> carry4s;
+        // A chain position whose O and CO, and every O/CO above it, have no user cannot
+        // affect anything; its S/DI need no driver.
+        std::vector<bool> live(grp.muxcys.size(), !fold_dead);
+        if (fold_dead) {
+            bool above = false;
+            for (int i = int(grp.muxcys.size()) - 1; i >= 0; i--) {
+                CellInfo *next_mux = (i + 1 < int(grp.muxcys.size())) ? grp.muxcys.at(i + 1) : nullptr;
+                CellInfo *next_xor = (i + 1 < int(grp.xorcys.size())) ? grp.xorcys.at(i + 1) : nullptr;
+                CellInfo *xorcy = grp.xorcys.at(i);
+                NetInfo *xo = xorcy ? get_net_or_empty(xorcy, ctx->id("O")) : nullptr;
+                if (xo != nullptr && !xo->users.empty())
+                    above = true;
+                NetInfo *mo = get_net_or_empty(grp.muxcys.at(i), ctx->id("O"));
+                if (mo != nullptr)
+                    for (auto &usr : mo->users)
+                        if (!((usr.cell == next_mux || usr.cell == next_xor) && usr.port == ctx->id("CI")))
+                            above = true;
+                live.at(i) = above;
+            }
+        }
         for (int i = 0; i < int(grp.muxcys.size()); i++) {
             int z = i % 4;
             CellInfo *muxcy = grp.muxcys.at(i), *xorcy = grp.xorcys.at(i);
@@ -324,6 +347,18 @@ void XC7Packer::pack_carries()
                 if (s_inputs > 4)
                     s_lut = nullptr;
             }
+            if (!live.at(i)) {
+                if (!s_lut && c4_s) {
+                    disconnect_port(ctx, c4, ctx->id("S[" + std::to_string(z) + "]"));
+                    c4_s = nullptr;
+                    ++dead_feeds;
+                }
+                if (!di_lut && c4_di) {
+                    disconnect_port(ctx, c4, ctx->id("DI[" + std::to_string(z) + "]"));
+                    c4_di = nullptr;
+                    ++dead_feeds;
+                }
+            }
             // If LUTs are nullptr, that means we need a feedthrough lut
             if (!s_lut && c4_s) {
                 PortRef pr;
@@ -363,6 +398,8 @@ void XC7Packer::pack_carries()
             new_cells.push_back(std::move(c4));
     }
     flush_cells();
+    if (fold_dead)
+        log_info("   Dropped %d feed-through LUTs on dead carry positions.\n", dead_feeds);
 
     for (auto net : folded_nets)
         ctx->nets.erase(net);
