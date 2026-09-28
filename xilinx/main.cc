@@ -51,7 +51,7 @@ po::options_description UspCommandHandler::getArchOptions()
     specific.add_options()("xdc", po::value<std::vector<std::string>>(), "XDC-style constraints file");
     specific.add_options()("fasm", po::value<std::string>(), "fasm bitstream file to write");
     specific.add_options()("xilinx-pack-fold-luts", po::value<std::string>()->implicit_value("all"),
-                           "fold packer-inserted LUTs; comma list of: inv, carry-dead (bare: all)");
+                           "fold packer-inserted LUTs; comma list of: inv, carry-dead, carry-di (bare: all)");
 
     return specific;
 }

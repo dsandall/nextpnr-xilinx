@@ -1108,6 +1108,15 @@ void Arch::assignCellInfo(CellInfo *cell)
             cell->carryInfo.x_sigs[i] = nullptr;
         }
         cell->carryInfo.x_sigs[0] = get_net_or_empty(cell, id("CYINIT"));
+        if (carry_di_ax) {
+            auto mask = cell->attrs.find(id("X_CARRY_DI_AX"));
+            if (mask != cell->attrs.end()) {
+                std::string m = mask->second.as_string();
+                for (int i = 0; i < 4 && i < int(m.size()); i++)
+                    if (m[i] == '1')
+                        cell->carryInfo.x_sigs[i] = get_net_or_empty(cell, id("DI" + std::to_string(i)));
+            }
+        }
     }
 }
 
