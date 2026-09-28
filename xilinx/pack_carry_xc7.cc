@@ -222,7 +222,10 @@ void XC7Packer::pack_carries()
     std::unordered_set<IdString> folded_nets;
 
     const bool fold_dead = fold_enabled("carry-dead");
-    int dead_feeds = 0;
+    const bool fold_di = fold_enabled("carry-di");
+    int dead_feeds = 0, di_bypass = 0;
+    if (fold_di)
+        ctx->carry_di_ax = true;
 
     for (auto &grp : groups) {
         std::vector<std::unique_ptr<CellInfo>> carry4s;
@@ -347,6 +350,45 @@ void XC7Packer::pack_carries()
                 if (s_inputs > 4)
                     s_lut = nullptr;
             }
+            // DI can enter the carry through the eighth's AX bypass (the CY0 mux) instead of
+            // a LUT5 feed-through. AX is shared with CYINIT at position 0 of a chain's first
+            // CARRY4, so there only a matching net may take it. With DI off the LUT, the S
+            // LUT has all six inputs to itself.
+            bool di_ax = false;
+            if (fold_di && c4_di) {
+                NetInfo *cyinit = (z == 0) ? get_net_or_empty(c4, ctx->id("CYINIT")) : nullptr;
+                if (cyinit == nullptr || cyinit == c4_di) {
+                    auto lut_inputs = [&](CellInfo *lut, int n, std::unordered_set<IdString> &into) {
+                        int count = 0;
+                        for (int j = 0; j < n; j++) {
+                            NetInfo *ix = get_net_or_empty(lut, ctx->id("I" + std::to_string(j)));
+                            if (ix) {
+                                into.insert(ix->name);
+                                count++;
+                            }
+                        }
+                        return count;
+                    };
+                    std::unordered_set<IdString> ins;
+                    s_lut = nullptr;
+                    int s_n = 0;
+                    if (c4_s && c4_s->users.size() == 1 && c4_s->driver.cell != nullptr &&
+                        (lut_types.count(c4_s->driver.cell->type) || c4_s->driver.cell->type == ctx->id("LUT6"))) {
+                        s_lut = c4_s->driver.cell;
+                        s_n = lut_inputs(s_lut, 6, ins);
+                    } else if (c4_s) {
+                        ins.insert(c4_s->name); // the S feed-through's input
+                    }
+                    di_lut = nullptr;
+                    if (s_n < 6 && c4_di->users.size() == 1 && c4_di->driver.cell != nullptr &&
+                        lut_types.count(c4_di->driver.cell->type)) {
+                        lut_inputs(c4_di->driver.cell, 5, ins);
+                        if (int(ins.size()) <= 5)
+                            di_lut = c4_di->driver.cell;
+                    }
+                    di_ax = (di_lut == nullptr);
+                }
+            }
             if (!live.at(i)) {
                 if (!s_lut && c4_s) {
                     disconnect_port(ctx, c4, ctx->id("S[" + std::to_string(z) + "]"));
@@ -368,7 +410,12 @@ void XC7Packer::pack_carries()
                 s_lut = s_feed.get();
                 new_cells.push_back(std::move(s_feed));
             }
-            if (!di_lut && c4_di) {
+            if (di_ax && c4_di) {
+                std::string mask = str_or_default(c4->attrs, ctx->id("X_CARRY_DI_AX"), "0000");
+                mask[z] = '1';
+                c4->attrs[ctx->id("X_CARRY_DI_AX")] = mask;
+                ++di_bypass;
+            } else if (!di_lut && c4_di) {
                 PortRef pr;
                 pr.cell = c4;
                 pr.port = ctx->id("DI[" + std::to_string(z) + "]");
@@ -400,6 +447,8 @@ void XC7Packer::pack_carries()
     flush_cells();
     if (fold_dead)
         log_info("   Dropped %d feed-through LUTs on dead carry positions.\n", dead_feeds);
+    if (fold_di)
+        log_info("   Routed %d carry DI inputs through the AX bypass.\n", di_bypass);
 
     for (auto net : folded_nets)
         ctx->nets.erase(net);

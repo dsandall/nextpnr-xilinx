@@ -756,6 +756,9 @@ struct Arch : BaseCtx
     Arch(ArchArgs args);
 
     bool xc7;
+    // --xilinx-pack-fold-luts carry-di: CARRY4 cells may carry X_CARRY_DI_AX, marking DI
+    // positions that enter through the AX bypass (validity must reserve AX for them).
+    bool carry_di_ax = false;
 
     std::string getChipName() const;
 
