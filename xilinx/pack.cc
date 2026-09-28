@@ -910,8 +910,62 @@ void USPacker::pack_uram()
     generic_xform(uram_rules, true);
 }
 
+bool XilinxPacker::fold_enabled(const std::string &what) const
+{
+    // Scan rather than ctx->id(): interning a new IdString shifts every later id and with
+    // it the packer's iteration order, so an unset flag must not create one.
+    for (auto &s : ctx->settings) {
+        if (s.first.str(ctx) != "xilinx/packFoldLuts")
+            continue;
+        std::string list = "," + s.second.as_string() + ",";
+        return list.find(",all,") != std::string::npos || list.find("," + what + ",") != std::string::npos;
+    }
+    return false;
+}
+
+// Yosys emits one INV per sink for an inverted control net (e.g. an active-low reset
+// feeding every flop's SR), and each lowers to its own LUT1. The xc7 slice cannot absorb
+// SR/CE inversion (only CLKINV exists), so keep one inverter per inverted net and hand it
+// all the sinks.
+void XilinxPacker::fold_inverters()
+{
+    const IdString id_INV = ctx->id("INV"), id_I = ctx->id("I"), id_O = ctx->id("O");
+    int merged = 0;
+    std::vector<IdString> dead_nets;
+    std::unordered_map<IdString, NetInfo *> kept;
+    for (auto cell : sorted(ctx->cells)) {
+        CellInfo *ci = cell.second;
+        if (ci->type != id_INV || is_frozen(ci))
+            continue;
+        NetInfo *in = get_net_or_empty(ci, id_I), *out = get_net_or_empty(ci, id_O);
+        if (in == nullptr || out == nullptr || in->driver.cell == nullptr)
+            continue;
+        auto k = kept.find(in->name);
+        if (k == kept.end()) {
+            kept[in->name] = out;
+            continue;
+        }
+        std::vector<PortRef> users(out->users.begin(), out->users.end());
+        for (auto &usr : users) {
+            disconnect_port(ctx, usr.cell, usr.port);
+            connect_port(ctx, k->second, usr.cell, usr.port);
+        }
+        disconnect_port(ctx, ci, id_I);
+        disconnect_port(ctx, ci, id_O);
+        dead_nets.push_back(out->name);
+        packed_cells.insert(ci->name);
+        ++merged;
+    }
+    flush_cells();
+    for (auto dn : dead_nets)
+        ctx->nets.erase(dn);
+    log_info("Folded inverters: %d merged into a twin on the same net.\n", merged);
+}
+
 void XilinxPacker::pack_inverters()
 {
+    if (fold_enabled("inv"))
+        fold_inverters();
     // FIXME: fold where possible
     for (auto cell : sorted(ctx->cells)) {
         CellInfo *ci = cell.second;

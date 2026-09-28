@@ -115,6 +115,10 @@ struct XilinxPacker
 
     void tie_port(CellInfo *ci, const std::string &port, bool value, bool inv = false);
 
+    // Opt-in LUT folding, --xilinx-pack-fold-luts <list>. Unset: the stock packer, unchanged.
+    bool fold_enabled(const std::string &what) const;
+    void fold_inverters();
+
     // LUTs & FFs
     void pack_inverters();
     void pack_luts();
