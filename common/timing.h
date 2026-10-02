@@ -45,6 +45,16 @@ struct NetCriticalityInfo
 typedef std::unordered_map<IdString, NetCriticalityInfo> NetCriticalityMap;
 void get_criticalities(Context *ctx, NetCriticalityMap *net_crit);
 
+// shortshift learned-criticality probe (feat/heap-learned-crit). Both are env-gated and
+// inert when the variables are unset.
+//   SPLIT_CRIT_DUMP=<path>           append one TSV row per (net, sink) with the
+//                                    criticality + the features a predictor would see;
+//                                    `tag` names the pass ("place" / "route").
+//   SPLIT_HEAP_CRIT_OVERRIDE=<path>  rows "net\tsink_cell\tsink_port\tcrit" that replace
+//                                    the STA criticality the HeAP net weights see.
+void dump_net_criticalities(Context *ctx, const std::string &path, const char *tag);
+bool apply_crit_override(Context *ctx, const std::string &path, NetCriticalityMap &net_crit);
+
 NEXTPNR_NAMESPACE_END
 
 #endif

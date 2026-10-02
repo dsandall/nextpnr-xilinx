@@ -154,7 +154,15 @@ class HeAPPlacer
         wirelen_t hpwl = total_hpwl();
         log_info("Creating initial analytic placement for %d cells, random placement wirelen = %d.\n",
                  int(place_cells.size()), int(hpwl));
-        for (int i = 0; i < 4; i++) {
+        // learned-criticality probe: a supplied criticality is known from the very first
+        // solve, where STA criticality only exists from the second outer iteration on.
+        if (crit_override)
+            apply_crit_override(ctx, crit_override, net_crit);
+        // warm start (feat/heap-learned-crit): SPLIT_HEAP_WARM_START=<file of "cell x y">
+        // seeds solver AND anchor positions, then skips the unanchored solves that would
+        // otherwise collapse the seed back to one point.
+        bool warm = load_warm_start();
+        for (int i = 0; i < (warm ? 0 : 4); i++) {
             setup_solve_cells();
             auto solve_startt = std::chrono::high_resolution_clock::now();
             boost::thread xaxis([&]() { build_solve_direction(false, -1); });
@@ -174,6 +182,10 @@ class HeAPPlacer
 
         wirelen_t solved_hpwl = 0, spread_hpwl = 0, legal_hpwl = 0, best_hpwl = std::numeric_limits<wirelen_t>::max();
         int iter = 0, stalled = 0;
+        if (warm) {
+            const char *w0 = getenv("SPLIT_HEAP_WARM_ITER0");
+            iter = w0 ? std::max(1, atoi(w0)) : 1;
+        }
 
         std::vector<std::tuple<CellInfo *, BelId, PlaceStrength>> solution;
 
@@ -253,8 +265,10 @@ class HeAPPlacer
                          std::chrono::duration<double>(run_stopt - run_startt).count());
             }
 
-            if (cfg.timing_driven)
+            if (cfg.timing_driven && !crit_no_sta)
                 get_criticalities(ctx, &net_crit);
+            if (crit_override)
+                apply_crit_override(ctx, crit_override, net_crit);
 
             if (legal_hpwl < best_hpwl) {
                 best_hpwl = legal_hpwl;
@@ -323,6 +337,23 @@ class HeAPPlacer
         } else {
             log_info("Skipping SA refinement (placerHeap/saRefine = false).\n");
         }
+        if (const char *d = getenv("SPLIT_CRIT_DUMP"))
+            dump_net_criticalities(ctx, d, "place");
+        if (const char *d = getenv("SPLIT_PLACE_DUMP")) {
+            FILE *f = fopen(d, "w");
+            if (f != nullptr) {
+                int n = 0;
+                for (auto cell : sorted(ctx->cells)) {
+                    if (cell.second->bel == BelId())
+                        continue;
+                    Loc l = ctx->getBelLocation(cell.second->bel);
+                    fprintf(f, "%s %d %d\n", cell.first.c_str(ctx), l.x, l.y);
+                    n++;
+                }
+                fclose(f);
+                log_info("SPLIT_PLACE_DUMP: %d cells to %s\n", n, d);
+            }
+        }
 
         return true;
     }
@@ -390,6 +421,11 @@ class HeAPPlacer
     double solve_time = 0, cl_time = 0, sl_time = 0;
 
     NetCriticalityMap net_crit;
+    // learned-criticality probe (timing.h): SPLIT_HEAP_CRIT_OVERRIDE supplies per-sink
+    // criticality; SPLIT_HEAP_CRIT_NO_STA=1 drops the per-iteration STA so the override
+    // is the only timing signal the net weights see.
+    const char *crit_override = getenv("SPLIT_HEAP_CRIT_OVERRIDE");
+    bool crit_no_sta = getenv("SPLIT_HEAP_CRIT_NO_STA") != nullptr;
 
     // Place cells with the BEL attribute set to constrain them
     void place_constraints()
@@ -545,6 +581,45 @@ class HeAPPlacer
 
     // Build up a random initial placement, without regard to legality
     // FIXME: Are there better approaches to the initial placement (e.g. greedy?)
+    bool load_warm_start()
+    {
+        const char *path = getenv("SPLIT_HEAP_WARM_START");
+        if (path == nullptr)
+            return false;
+        FILE *f = fopen(path, "r");
+        if (f == nullptr) {
+            log_warning("SPLIT_HEAP_WARM_START: cannot open %s, cold start\n", path);
+            return false;
+        }
+        std::unordered_map<std::string, std::pair<int, int>> pos;
+        char name[1024];
+        int x, y;
+        while (fscanf(f, "%1023s %d %d", name, &x, &y) == 3)
+            pos[name] = {x, y};
+        fclose(f);
+        int hit = 0;
+        for (auto ci : place_cells) {
+            auto it = pos.find(ci->name.str(ctx));
+            if (it == pos.end())
+                continue;
+            auto &cl = cell_locs.at(ci->name);
+            cl.x = cl.legal_x = std::min(max_x, std::max(0, it->second.first));
+            cl.y = cl.legal_y = std::min(max_y, std::max(0, it->second.second));
+            cl.rawx = cl.x;
+            cl.rawy = cl.y;
+            hit++;
+        }
+        update_all_chains();
+        for (auto &cl : cell_locs) {
+            cl.second.legal_x = cl.second.x;
+            cl.second.legal_y = cl.second.y;
+        }
+        log_info("SPLIT_HEAP_WARM_START: seeded %d of %d placeable cells (%d not in file) from %d rows in %s; "
+                 "wirelen = %d\n",
+                 hit, int(place_cells.size()), int(place_cells.size()) - hit, int(pos.size()), path, int(total_hpwl()));
+        return hit > 0;
+    }
+
     void seed_placement()
     {
         std::unordered_map<IdString, std::deque<BelId>> available_bels;

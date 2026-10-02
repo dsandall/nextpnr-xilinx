@@ -2603,6 +2603,8 @@ void router2(Context *ctx, const Router2Cfg &cfg)
     Router2 rt(ctx, cfg);
     rt.ctx = ctx;
     rt();
+    if (const char *d = getenv("SPLIT_CRIT_DUMP"))
+        dump_net_criticalities(ctx, d, "route");
 }
 
 Router2Cfg::Router2Cfg(Context *ctx)

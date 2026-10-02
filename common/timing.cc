@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <boost/range/adaptor/reversed.hpp>
 #include <cmath>
+#include <cstdio>
+#include <string>
 #include <deque>
 #include <map>
 #include <unordered_map>
@@ -1001,6 +1003,106 @@ void get_criticalities(Context *ctx, NetCriticalityMap *net_crit)
     net_crit->clear();
     Timing timing(ctx, true, true, &crit_paths, nullptr, net_crit);
     timing.walk_paths();
+}
+
+// ---- shortshift learned-criticality probe ---------------------------------------------
+// One row per (net, sink). The delay column is whatever getNetinfoRouteDelay returns at
+// the time of the call: the arch's estimate before routing, the walked route after.
+void dump_net_criticalities(Context *ctx, const std::string &path, const char *tag)
+{
+    NetCriticalityMap net_crit;
+    get_criticalities(ctx, &net_crit);
+    FILE *f = fopen(path.c_str(), "a");
+    if (f == nullptr) {
+        log_warning("SPLIT_CRIT_DUMP: cannot open %s\n", path.c_str());
+        return;
+    }
+    if (ftell(f) == 0)
+        fprintf(f, "tag\tnet\tdrv_cell\tdrv_type\tdrv_x\tdrv_y\tsink_cell\tsink_port\tsink_type\tsink_x\tsink_y\t"
+                   "fanout\tbbox_w\tbbox_h\tdelay_ns\tslack_ns\tcrit\tmax_path_len\n");
+    auto loc_of = [&](const CellInfo *ci) {
+        if (ci == nullptr || ci->bel == BelId())
+            return Loc(-1, -1, -1);
+        return ctx->getBelLocation(ci->bel);
+    };
+    int rows = 0;
+    for (auto &net : sorted(ctx->nets)) {
+        NetInfo *ni = net.second;
+        if (ni->driver.cell == nullptr || ni->users.empty())
+            continue;
+        Loc d = loc_of(ni->driver.cell);
+        int x0 = d.x, x1 = d.x, y0 = d.y, y1 = d.y;
+        for (auto &u : ni->users) {
+            Loc l = loc_of(u.cell);
+            if (l.x < 0)
+                continue;
+            x0 = std::min(x0, l.x); x1 = std::max(x1, l.x);
+            y0 = std::min(y0, l.y); y1 = std::max(y1, l.y);
+        }
+        auto fnd = net_crit.find(ni->name);
+        for (size_t i = 0; i < ni->users.size(); i++) {
+            auto &u = ni->users.at(i);
+            Loc s = loc_of(u.cell);
+            float crit = 0; double slack_ns = NAN; unsigned mpl = 0;
+            if (fnd != net_crit.end()) {
+                auto &nc = fnd->second;
+                if (i < nc.criticality.size()) crit = nc.criticality.at(i);
+                if (i < nc.slack.size() && nc.slack.at(i) != std::numeric_limits<delay_t>::max())
+                    slack_ns = ctx->getDelayNS(nc.slack.at(i));
+                mpl = nc.max_path_length;
+            }
+            fprintf(f, "%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%.3f\t%.3f\t%.4f\t%u\n", tag,
+                    ni->name.c_str(ctx), ni->driver.cell->name.c_str(ctx), ni->driver.cell->type.c_str(ctx), d.x, d.y,
+                    u.cell->name.c_str(ctx), u.port.c_str(ctx), u.cell->type.c_str(ctx), s.x, s.y,
+                    int(ni->users.size()), x1 - x0, y1 - y0, ctx->getDelayNS(ctx->getNetinfoRouteDelay(ni, u)),
+                    slack_ns, crit, mpl);
+            rows++;
+        }
+    }
+    fclose(f);
+    log_info("SPLIT_CRIT_DUMP: wrote %d '%s' rows to %s\n", rows, tag, path.c_str());
+}
+
+// Replace the criticality of every listed (net, sink) with the file's value; unlisted
+// sinks keep what STA gave them. Keyed by names, not user index, so a dump from one run
+// can drive another. Returns false if the file cannot be read.
+bool apply_crit_override(Context *ctx, const std::string &path, NetCriticalityMap &net_crit)
+{
+    static std::unordered_map<std::string, float> table;
+    static bool loaded = false;
+    if (!loaded) {
+        loaded = true;
+        FILE *f = fopen(path.c_str(), "r");
+        if (f == nullptr) {
+            log_warning("SPLIT_HEAP_CRIT_OVERRIDE: cannot open %s\n", path.c_str());
+            return false;
+        }
+        char net[512], cell[512], port[128];
+        float crit;
+        while (fscanf(f, "%511s %511s %127s %f", net, cell, port, &crit) == 4)
+            table[std::string(net) + "\t" + cell + "\t" + port] = crit;
+        fclose(f);
+        log_info("SPLIT_HEAP_CRIT_OVERRIDE: %d (net, sink) rows from %s\n", int(table.size()), path.c_str());
+    }
+    int hit = 0;
+    for (auto &net : ctx->nets) {
+        NetInfo *ni = net.second.get();
+        for (size_t i = 0; i < ni->users.size(); i++) {
+            auto &u = ni->users.at(i);
+            auto it = table.find(std::string(ni->name.c_str(ctx)) + "\t" + u.cell->name.c_str(ctx) + "\t" +
+                                 u.port.c_str(ctx));
+            if (it == table.end())
+                continue;
+            auto &nc = net_crit[ni->name];
+            if (nc.criticality.size() != ni->users.size())
+                nc.criticality.resize(ni->users.size(), 0.0f);
+            nc.criticality.at(i) = it->second;
+            hit++;
+        }
+    }
+    if (ctx->verbose)
+        log_info("SPLIT_HEAP_CRIT_OVERRIDE: applied %d sinks\n", hit);
+    return true;
 }
 
 NEXTPNR_NAMESPACE_END
