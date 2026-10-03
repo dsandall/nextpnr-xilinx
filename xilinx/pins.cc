@@ -106,10 +106,12 @@ void get_invertible_pins(Context *ctx, std::unordered_map<IdString, std::unorder
     invertible_pins[ctx->id("ISERDESE3")].insert(ctx->id("CLK_B"));
     invertible_pins[ctx->id("ISERDESE3")].insert(ctx->id("CLK"));
     invertible_pins[ctx->id("ISERDESE3")].insert(ctx->id("RST"));
-    invertible_pins[ctx->id("LDCE")].insert(ctx->id("CLR"));
+    if (!ctx->xc7)
+        invertible_pins[ctx->id("LDCE")].insert(ctx->id("CLR"));
     invertible_pins[ctx->id("LDCE")].insert(ctx->id("G"));
     invertible_pins[ctx->id("LDPE")].insert(ctx->id("G"));
-    invertible_pins[ctx->id("LDPE")].insert(ctx->id("PRE"));
+    if (!ctx->xc7)
+        invertible_pins[ctx->id("LDPE")].insert(ctx->id("PRE"));
     invertible_pins[ctx->id("MMCME3_ADV")].insert(ctx->id("CLKFBIN"));
     invertible_pins[ctx->id("MMCME3_ADV")].insert(ctx->id("CLKIN1"));
     invertible_pins[ctx->id("MMCME3_ADV")].insert(ctx->id("CLKIN2"));
