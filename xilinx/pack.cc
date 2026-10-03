@@ -233,7 +233,25 @@ void XilinxPacker::pack_ffs()
     ff_rules[ctx->id("FDSE_1")] = ff_rules[ctx->id("FDSE")];
     ff_rules[ctx->id("FDSE_1")].set_params.emplace_back(ctx->id("IS_CLK_INVERTED"), 1);
 
+    // Latches (LDCE/LDPE): the slice FF in LATCH mode, gate on CK, enable on CE.
+    for (auto latch : {ctx->id("LDCE"), ctx->id("LDPE")}) {
+        ff_rules[latch].new_type = id_SLICE_FFX;
+        ff_rules[latch].port_xform[ctx->id("G")] = ctx->xc7 ? id_CK : id_CLK;
+        ff_rules[latch].port_xform[ctx->id("GE")] = id_CE;
+        ff_rules[latch].port_xform[latch == ctx->id("LDCE") ? ctx->id("CLR") : ctx->id("PRE")] = id_SR;
+        ff_rules[latch].set_attrs.emplace_back(id_X_FF_AS_LATCH, "1");
+    }
+
     generic_xform(ff_rules, true);
+
+    // The slice latch is transparent while CK is LOW (prjxray: fasm2bels reconstructs
+    // IS_G_INVERTED = !CLKINV), so an uninverted G lands on CK through the inverter.
+    for (auto cell : sorted(ctx->cells)) {
+        CellInfo *ci = cell.second;
+        if (ci->type == id_SLICE_FFX && ci->attrs.count(id_X_FF_AS_LATCH))
+            ci->params[ctx->id("IS_CLK_INVERTED")] =
+                    Property(bool_or_default(ci->params, ctx->id("IS_G_INVERTED"), false) ? 0 : 1, 1);
+    }
 }
 
 void XilinxPacker::pack_lutffs()

@@ -568,6 +568,16 @@ struct FasmBackend
                     SET_CHECK(negedge_ff, true);
                     SET_CHECK(is_latch, false);
                     SET_CHECK(is_sync, false);
+                } else if (type == "LDCE") {
+                    zrst = true;
+                    SET_CHECK(negedge_ff, false);
+                    SET_CHECK(is_latch, true);
+                    SET_CHECK(is_sync, false);
+                } else if (type == "LDPE") {
+                    zrst = false;
+                    SET_CHECK(negedge_ff, false);
+                    SET_CHECK(is_latch, true);
+                    SET_CHECK(is_sync, false);
                 } else {
                     log_error("unsupported FF type: '%s'\n", type.c_str());
                 }
