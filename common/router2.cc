@@ -37,6 +37,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <queue>
 #include <set>
 #include <thread>
@@ -233,6 +234,17 @@ struct Router2
     int stall_best_overuse = std::numeric_limits<int>::max();
     int stall_iters = 0; // consecutive iterations without improvement
     int d1_iter = 0;                   // current main-loop iteration (set each iter)
+    // learned-slot probe (docs/270 follow-up): SPLIT_ROUTE_ARC_DUMP=<tsv> appends one row
+    // per forward-A* arc. pops/path_wires bounds what a perfect heuristic could save;
+    // h0/cost compares the togo estimate at the source with the cost actually found.
+    FILE *arc_dump = [] {
+        const char *p = getenv("SPLIT_ROUTE_ARC_DUMP");
+        FILE *f = p ? fopen(p, "w") : nullptr;
+        if (f)
+            fprintf(f, "riter\tnet\tarc\tis_bb\tok\tpops\tpushes\tpath_wires\th0\tcost\tdelay_ns\tbb_w\tbb_h\tfanout\n");
+        return f;
+    }();
+    std::mutex arc_dump_mtx;
     int d1_band_iters = 0;             // iterations spent inside the traced band
     std::map<WireId, int> d1_wire_iters; // wire -> #iterations seen overused (in band)
     std::set<int> d1_net_udatas;       // cumulative contesting nets (udata), in band
@@ -1362,8 +1374,12 @@ struct Router2
         if (was_visited(dst_wire_idx)) {
             ROUTE_LOG_DBG("   Routed (explored %d wires): ", explored);
             int cursor_bwd = dst_wire_idx;
+            int path_wires = 0;
+            const float found_cost = flat_wires.at(dst_wire_idx).visit.score.cost;
+            const float found_delay = flat_wires.at(dst_wire_idx).visit.score.delay;
             while (was_visited(cursor_bwd)) {
                 auto &v = flat_wires.at(cursor_bwd).visit;
+                ++path_wires;
                 bind_pip_internal(net, i, cursor_bwd, v.pip);
                 if (ctx->debug) {
                     auto &wd = flat_wires.at(cursor_bwd);
@@ -1379,11 +1395,24 @@ struct Router2
                               ctx->getPipLocation(v.pip).y);
                 cursor_bwd = wire_to_idx.at(ctx->getPipSrcWire(v.pip));
             }
+            if (arc_dump) {
+                std::lock_guard<std::mutex> lk(arc_dump_mtx);
+                fprintf(arc_dump, "%d\t%s\t%d\t%d\t1\t%d\t%d\t%d\t%.4f\t%.4f\t%.4f\t%d\t%d\t%d\n", d1_iter,
+                        ctx->nameOf(net), int(i), int(is_bb), iter, explored, path_wires, base_score.togo_cost,
+                        found_cost, ctx->getDelayNS(found_delay), nd.bb.x1 - nd.bb.x0, nd.bb.y1 - nd.bb.y0,
+                        int(net->users.size()));
+            }
             t.processed_sinks.insert(dst_wire);
             ad.routed = true;
             reset_wires(t);
             return ARC_SUCCESS;
         } else {
+            if (arc_dump) {
+                std::lock_guard<std::mutex> lk(arc_dump_mtx);
+                fprintf(arc_dump, "%d\t%s\t%d\t%d\t0\t%d\t%d\t0\t%.4f\tnan\tnan\t%d\t%d\t%d\n", d1_iter,
+                        ctx->nameOf(net), int(i), int(is_bb), iter, explored, base_score.togo_cost,
+                        nd.bb.x1 - nd.bb.x0, nd.bb.y1 - nd.bb.y0, int(net->users.size()));
+            }
             if (!is_bb)   // unbounded retry exhausted: name what rejected the frontier
                 log_info("[fail-diag] arc %d of %s: A* drained after %d iters; "
                          "rej{bb=%ld pip=%ld unavail=%ld resv=%ld soft=%ld ownpip=%ld ttw=%ld}\n",
@@ -2603,6 +2632,10 @@ void router2(Context *ctx, const Router2Cfg &cfg)
     Router2 rt(ctx, cfg);
     rt.ctx = ctx;
     rt();
+    if (rt.arc_dump) {
+        fclose(rt.arc_dump);
+        rt.arc_dump = nullptr;
+    }
     if (const char *d = getenv("SPLIT_CRIT_DUMP"))
         dump_net_criticalities(ctx, d, "route");
 }
@@ -2619,6 +2652,8 @@ Router2Cfg::Router2Cfg(Context *ctx)
     hist_cong_weight = ctx->setting<float>("router2/histCongWeight", 1.0f);
     curr_cong_mult = ctx->setting<float>("router2/currCongWeightMult", 2.0f);
     estimate_weight = ctx->setting<float>("router2/estimateWeight", 1.75f);
+    if (const char *w = getenv("SPLIT_ROUTER2_ESTIMATE_WEIGHT")) // learned-slot probe (docs/270)
+        estimate_weight = float(atof(w));
     perf_profile = ctx->setting<float>("router2/perfProfile", false);
 }
 
